@@ -6,17 +6,10 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    env:
-      ANDROID_SDK_ROOT: ${{ github.workspace }}/android-sdk
     steps:
       - uses: actions/checkout@v4
 
-      - name: 清除系统自带冲突的ANDROID_HOME变量
-        run: |
-          unset ANDROID_HOME
-          echo "ANDROID_HOME=" >> $GITHUB_ENV
-
-      - name: 解压仓库根目录source.zip
+      - name: 解压source.zip源码包
         run: unzip -o source.zip
 
       - name: 设置JDK17
@@ -25,26 +18,21 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: 下载Android命令行工具
-        run: |
-          mkdir -p $ANDROID_SDK_ROOT/cmdline-tools
-          wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -O cmdline.zip
-          unzip -q cmdline.zip -d $ANDROID_SDK_ROOT/cmdline-tools
-          mv $ANDROID_SDK_ROOT/cmdline-tools/cmdline-tools $ANDROID_SDK_ROOT/cmdline-tools/latest
-          echo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin" >> $GITHUB_PATH
+      - name: 配置Android SDK（自动处理环境变量冲突）
+        uses: android-actions/setup-android@v4
+        with:
+          packages: >
+            platform-tools
+            platforms;android-33
+            build-tools;33.0.2
 
-      - name: 接受许可，安装SDK‑33、build‑tools 33.0.2
-        run: |
-          yes | sdkmanager --licenses
-          sdkmanager "platform-tools" "platforms;android-33" "build-tools;33.0.2"
-
-      - name: 给gradlew执行权限
+      - name: 给gradlew可执行权限
         run: chmod +x gradlew
 
       - name: 编译Debug APK
         run: ./gradlew assembleDebug
 
-      - name: 上传生成APK
+      - name: 输出APK产物
         uses: actions/upload-artifact@v4
         with:
           name: app-debug
