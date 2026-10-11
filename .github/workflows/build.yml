@@ -18,10 +18,10 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: 安装Android SDK，android‑33
-        uses: actions/setup-android@v3
+      - name: 安装Android SDK android‑33
+        uses: amondnet/androidsdk@v2
         with:
-          api-levels: 33
+          api-level: 33
           build-tools: "33.0.2"
 
       - name: 给gradlew执行权限
@@ -30,7 +30,7 @@ jobs:
       - name: 编译Debug APK
         run: ./gradlew assembleDebug
 
-      - name: 下载生成APK
+      - name: 上传生成APK
         uses: actions/upload-artifact@v4
         with:
           name: app-debug
