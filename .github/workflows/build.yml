@@ -18,6 +18,12 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
+      - name: 安装Android SDK，android‑33
+        uses: actions/setup-android@v3
+        with:
+          api-levels: 33
+          build-tools: "33.0.2"
+
       - name: 给gradlew执行权限
         run: chmod +x gradlew
 
