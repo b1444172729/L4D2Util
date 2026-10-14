@@ -1,4 +1,13 @@
 # Github的源码编译成APK的脚本
+#
+# 在原始脚本基础上做的最小改动，只动「不改就必然构建失败」的点：
+#   1) 摊平锚点 gradlew -> package.json + src-tauri
+#      （gradlew 在 src-tauri/gen/android 深处，按它摊平会把 Android 工程拽散）
+#   2) mv -> cp -a 合并（仓库已有 .github 时 mv 会撞 "Directory not empty"）
+#   3) SDK 33 -> SDK 36 + NDK 27（工程 compileSdk/targetSdk 写死 36）
+#   4) ./gradlew assembleDebug -> npm run android:build:apk
+#      （tauri.settings.gradle 只有 Tauri CLI 构建时才生成，直接跑 gradlew 必挂）
+#   5) 补 Rust / cargo-ndk / 签名密钥
 name: Build APK-from-zip
 on:
   push:
@@ -7,35 +16,42 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
 
       - name: 解压source.zip源码包
-        run: unzip -o source.zip
+        # 仓库里若已直接放源码则跳过，不再依赖 zip 上传
+        run: |
+          if [ -f source.zip ]; then
+            unzip -o source.zip
+          else
+            echo "未发现 source.zip，直接使用仓库内的源码"
+          fi
 
-      - name: 自动检测子文件夹并移动到根目录
+      - name: 自动检测子文件夹并合并到根目录
         run: |
           set -e
           # 循环处理，兼容包了两层目录的情况；最多 3 轮防止死循环
           for i in 1 2 3; do
-            if [ -f gradlew ]; then
-              echo "gradlew 已在根目录"
+            # 锚点改成 package.json + src-tauri，不再用 gradlew
+            if [ -f package.json ] && [ -d src-tauri ]; then
+              echo "工程根已在当前目录"
               break
             fi
-            SUBDIR=$(find . -name "gradlew" -printf "%h\n" | sort | head -1)
-            if [ -z "$SUBDIR" ]; then
+            SUBDIR=$(find . -name "package.json" -not -path "*/node_modules/*" -printf "%h\n" | sort | head -1)
+            if [ -z "$SUBDIR" ] || [ "$SUBDIR" = "." ]; then
               break
             fi
-            echo "检测到子文件夹: $SUBDIR，移动到根目录"
-            # 两条 glob 分别匹配普通文件和隐藏文件（.gradle、.gitignore 等），兼容 sh/bash
-            for f in "$SUBDIR"/* "$SUBDIR"/.[!.]*; do
-              [ -e "$f" ] && mv "$f" .
-            done
-            rmdir "$SUBDIR" 2>/dev/null || rm -rf "$SUBDIR"
+            echo "检测到子文件夹: $SUBDIR，合并到根目录"
+            # cp -a "$SUBDIR"/. ./ 做目录合并（mv 撞非空同名目录会报 Directory not empty），
+            # 且 /. 的写法能带上 .github、.gitignore 等隐藏文件
+            cp -a "$SUBDIR"/. ./
+            rm -rf "$SUBDIR"
           done
-          # 校验：确保后续步骤能找到 gradlew，失败时在 Actions 面板标红
-          if [ ! -f gradlew ]; then
-            echo "::error::解压后仍未找到 gradlew，请检查 source.zip 的结构"
+          # 校验：确保后续步骤能找到工程入口，失败时在 Actions 面板标红
+          if [ ! -f package.json ] || [ ! -d src-tauri/gen/android ]; then
+            echo "::error::未找到 package.json 或 src-tauri/gen/android，请检查 source.zip 的结构"
             exit 1
           fi
           ls -la
@@ -43,8 +59,9 @@ jobs:
       - name: （可选）Gradle 下载地址替换为腾讯云镜像
         run: |
           # 只换域名，保留项目原本声明的 Gradle 版本（兼容 https\:// 与 https:// 两种写法）
-          sed -i 's|services\.gradle\.org/distributions/|mirrors.cloud.tencent.com/gradle/|' gradle/wrapper/gradle-wrapper.properties
-          cat gradle/wrapper/gradle-wrapper.properties
+          # 路径改为 src-tauri/gen/android 下（工程摊平后 gradlew 不在根目录）
+          sed -i 's|services\.gradle\.org/distributions/|mirrors.cloud.tencent.com/gradle/|' src-tauri/gen/android/gradle/wrapper/gradle-wrapper.properties
+          cat src-tauri/gen/android/gradle/wrapper/gradle-wrapper.properties
 
       - name: 设置JDK17
         uses: actions/setup-java@v5
@@ -52,22 +69,85 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
+      - name: 设置Node20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
       - name: 配置Android SDK（自动处理环境变量冲突）
         uses: android-actions/setup-android@v4
         with:
+          # 工程 compileSdk/targetSdk 均为 36，33 会编译失败；NDK 27 供 Rust 交叉编译
           packages: >
             platform-tools
-            platforms;android-33
-            build-tools;33.0.2
+            platforms;android-36
+            build-tools;36.0.0
+            ndk;27.1.12297006
 
-      - name: 给gradlew可执行权限
-        run: chmod +x gradlew
+      - name: 安装Rust与Android target
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup target add aarch64-linux-android armv7-linux-androideabi
+          cargo install cargo-ndk --locked
 
-      - name: 编译Debug APK
-        run: ./gradlew assembleDebug
+      - name: NDK27补齐legacy binutils前缀
+        # NDK 27 只提供 llvm-ranlib/llvm-ar，Rust 交叉编译要找 <target>-ranlib
+        run: |
+          set -e
+          NDK_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          if [ ! -d "$NDK_BIN" ]; then
+            echo "::error::找不到 NDK bin 目录: $NDK_BIN"
+            exit 1
+          fi
+          for target in aarch64-linux-android armv7a-linux-androideabi arm-linux-androideabi; do
+            for tool in ranlib ar strip nm objcopy objdump readelf; do
+              [ -e "$NDK_BIN/${target}-${tool}" ] || ln -sf "$NDK_BIN/llvm-${tool}" "$NDK_BIN/${target}-${tool}"
+            done
+          done
+          echo "$NDK_BIN" >> "$GITHUB_PATH"
+
+      - name: 安装前端依赖
+        run: npm ci
+
+      - name: 准备签名密钥
+        # 缺失时 Gradle 产出 -unsigned.apk，手机安装报“安装包无效”
+        run: |
+          set -e
+          keytool -genkeypair -v \
+            -keystore "$RUNNER_TEMP/submarine-release.jks" -storetype JKS \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -alias submarine -storepass submarine -keypass submarine \
+            -dname "CN=Submarine, OU=Dev, O=Submarine, C=CN"
+          echo "SUBMARINE_KEYSTORE_PATH=$RUNNER_TEMP/submarine-release.jks" >> "$GITHUB_ENV"
+          echo "SUBMARINE_KEYSTORE_PASSWORD=submarine"                       >> "$GITHUB_ENV"
+          echo "SUBMARINE_KEY_ALIAS=submarine"                               >> "$GITHUB_ENV"
+          echo "SUBMARINE_KEY_PASSWORD=submarine"                            >> "$GITHUB_ENV"
+
+      - name: 编译Release APK
+        env:
+          CARGO_INCREMENTAL: '0'
+        run: |
+          set -e
+          . "$HOME/.cargo/env"
+          # 走 Tauri CLI：自动生成 tauri.settings.gradle / tauri.build.gradle.kts /
+          # tauri.properties，再编 Rust 与 Gradle；不能直接 ./gradlew
+          npm run android:build:apk
+
+      - name: 校验产物已签名
+        run: |
+          set -e
+          echo "=== APK 产物 ==="
+          find src-tauri/gen/android/app/build/outputs/apk -name "*.apk" -print
+          if find src-tauri/gen/android/app/build/outputs/apk -name "*-unsigned.apk" | grep -q .; then
+            echo "::error::产出了未签名 APK，签名配置未生效"
+            exit 1
+          fi
 
       - name: 输出APK产物
         uses: actions/upload-artifact@v4
         with:
-          name: app-debug
-          path: app/build/outputs/apk/debug/*.apk
+          name: app-release
+          path: src-tauri/gen/android/app/build/outputs/apk/**/*.apk
+          if-no-files-found: error
