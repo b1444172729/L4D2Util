@@ -1,73 +1,154 @@
-# Github的源码编译成APK的脚本
+# Github 的源码编译成 APK 的脚本（Tauri 工程修正版）
+#
+# 原脚本失败的根因：直接 ./gradlew assembleDebug。
+# src-tauri/gen/android/tauri.settings.gradle 是 Tauri CLI 在 build 时才生成的
+# （已被 .gitignore 忽略、不在仓库里），Gradle 一启动就报
+# "Could not read tauri.settings.gradle"。必须由 `tauri android build` 驱动。
+#
+# 前置：source.zip 需提交到仓库根目录，解压后根目录含 package.json 与 src-tauri/
 name: Build APK-from-zip
 on:
   push:
     branches: [ main ]
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    # 首次全量编译 Rust（3.2 万行 + 重依赖）耗时较长，给足上限
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
 
-      - name: 解压source.zip源码包
+      - name: 解压 source.zip 源码包
         run: unzip -o source.zip
 
       - name: 自动检测子文件夹并移动到根目录
         run: |
           set -e
-          # 循环处理，兼容包了两层目录的情况；最多 3 轮防止死循环
+          # 以 package.json + src-tauri 为锚点，而不是 gradlew ——
+          # Tauri 工程的 gradlew 在 src-tauri/gen/android/ 深处，按它扁平化会拆散工程。
           for i in 1 2 3; do
-            if [ -f gradlew ]; then
-              echo "gradlew 已在根目录"
+            if [ -f package.json ] && [ -d src-tauri ]; then
+              echo "工程根已在当前目录"
               break
             fi
-            SUBDIR=$(find . -name "gradlew" -printf "%h\n" | sort | head -1)
-            if [ -z "$SUBDIR" ]; then
+            SUBDIR=$(find . -name "package.json" -not -path "*/node_modules/*" -printf "%h\n" | sort | head -1)
+            if [ -z "$SUBDIR" ] || [ "$SUBDIR" = "." ]; then
               break
             fi
             echo "检测到子文件夹: $SUBDIR，移动到根目录"
-            # 两条 glob 分别匹配普通文件和隐藏文件（.gradle、.gitignore 等），兼容 sh/bash
+            # 两条 glob 分别匹配普通文件和隐藏文件（.gradle、.gitignore 等）
             for f in "$SUBDIR"/* "$SUBDIR"/.[!.]*; do
               [ -e "$f" ] && mv "$f" .
             done
             rmdir "$SUBDIR" 2>/dev/null || rm -rf "$SUBDIR"
           done
-          # 校验：确保后续步骤能找到 gradlew，失败时在 Actions 面板标红
-          if [ ! -f gradlew ]; then
-            echo "::error::解压后仍未找到 gradlew，请检查 source.zip 的结构"
+          if [ ! -f package.json ] || [ ! -d src-tauri/gen/android ]; then
+            echo "::error::解压后未找到 package.json 或 src-tauri/gen/android，请检查 source.zip 结构"
             exit 1
           fi
           ls -la
 
-      - name: （可选）Gradle 下载地址替换为腾讯云镜像
+      - name: Gradle 下载地址替换为腾讯云镜像
         run: |
           # 只换域名，保留项目原本声明的 Gradle 版本（兼容 https\:// 与 https:// 两种写法）
-          sed -i 's|services\.gradle\.org/distributions/|mirrors.cloud.tencent.com/gradle/|' gradle/wrapper/gradle-wrapper.properties
-          cat gradle/wrapper/gradle-wrapper.properties
+          sed -i 's|services\.gradle\.org/distributions/|mirrors.cloud.tencent.com/gradle/|' \
+            src-tauri/gen/android/gradle/wrapper/gradle-wrapper.properties
+          cat src-tauri/gen/android/gradle/wrapper/gradle-wrapper.properties
 
-      - name: 设置JDK17
+      - name: 设置 JDK 17
         uses: actions/setup-java@v5
         with:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: 配置Android SDK（自动处理环境变量冲突）
+      - name: 设置 Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: 配置 Android SDK（36 + build-tools 36 + NDK 27）
         uses: android-actions/setup-android@v4
         with:
+          # app/build.gradle.kts 里 compileSdk/targetSdk 均为 36，33 会直接编译失败
           packages: >
             platform-tools
-            platforms;android-33
-            build-tools;33.0.2
+            platforms;android-36
+            build-tools;36.0.0
+            ndk;27.1.12297006
 
-      - name: 给gradlew可执行权限
-        run: chmod +x gradlew
+      - name: 安装 Rust 与 Android target
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup target add aarch64-linux-android armv7-linux-androideabi
+          cargo install cargo-ndk --locked
 
-      - name: 编译Debug APK
-        run: ./gradlew assembleDebug
+      - name: NDK 27 补齐 legacy binutils 前缀
+        # NDK 27 只提供 llvm-ranlib / llvm-ar 等，Rust 交叉编译却要找
+        # <target>-ranlib，缺失时报 "<target>-ranlib: not found"
+        run: |
+          set -e
+          NDK_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          if [ ! -d "$NDK_BIN" ]; then
+            echo "::error::找不到 NDK bin 目录: $NDK_BIN"
+            exit 1
+          fi
+          for target in aarch64-linux-android armv7a-linux-androideabi arm-linux-androideabi; do
+            for tool in ranlib ar strip nm objcopy objdump readelf; do
+              [ -e "$NDK_BIN/${target}-${tool}" ] || ln -sf "$NDK_BIN/llvm-${tool}" "$NDK_BIN/${target}-${tool}"
+            done
+          done
+          echo "$NDK_BIN" >> "$GITHUB_PATH"
 
-      - name: 输出APK产物
+      - name: 安装前端依赖
+        run: npm ci
+
+      - name: 准备签名密钥
+        # app/build.gradle.kts 读 SUBMARINE_KEYSTORE_* 四个变量；
+        # 缺失时会产出 -unsigned.apk，手机安装报“安装包无效”。
+        # 这里生成临时密钥保证产物可安装；正式发布请换成自己的密钥并存入 Secrets。
+        run: |
+          set -e
+          keytool -genkeypair -v \
+            -keystore "$RUNNER_TEMP/submarine-release.jks" \
+            -storetype JKS \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -alias submarine \
+            -storepass submarine -keypass submarine \
+            -dname "CN=Submarine, OU=Dev, O=Submarine, C=CN"
+          echo "SUBMARINE_KEYSTORE_PATH=$RUNNER_TEMP/submarine-release.jks"    >> "$GITHUB_ENV"
+          echo "SUBMARINE_KEYSTORE_PASSWORD=submarine"                          >> "$GITHUB_ENV"
+          echo "SUBMARINE_KEY_ALIAS=submarine"                                  >> "$GITHUB_ENV"
+          echo "SUBMARINE_KEY_PASSWORD=submarine"                               >> "$GITHUB_ENV"
+
+      - name: 编译 Release APK
+        env:
+          # Cargo 增量编译在容器里易撑爆磁盘
+          CARGO_INCREMENTAL: '0'
+        run: |
+          set -e
+          . "$HOME/.cargo/env"
+          # 走 Tauri CLI：自动生成 tauri.settings.gradle / tauri.build.gradle.kts /
+          # tauri.properties -> 执行 beforeBuildCommand(npm run build) -> cargo 交叉编译
+          # -> gradle assembleRelease -> 产出 universal APK
+          npm run android:build:apk
+
+      - name: 校验产物已签名
+        run: |
+          set -e
+          echo "=== APK 产物 ==="
+          find src-tauri/gen/android/app/build/outputs/apk -name "*.apk" -print
+          if find src-tauri/gen/android/app/build/outputs/apk -name "*-unsigned.apk" | grep -q .; then
+            echo "::error::产出了未签名 APK，签名配置未生效"
+            exit 1
+          fi
+
+      - name: 输出 APK 产物
         uses: actions/upload-artifact@v4
         with:
-          name: app-debug
-          path: app/build/outputs/apk/debug/*.apk
+          name: app-release
+          path: src-tauri/gen/android/app/build/outputs/apk/**/*.apk
+          if-no-files-found: error
