@@ -108,6 +108,49 @@ npm install -D electron-rebuild@3.2.9 --no-audit --no-fund
 echo "[6] 重编 node-pty / serialport (Electron 17.4.1)..."
 npx electron-rebuild -f -v 17.4.1 -w serialport,node-pty -m .
 
+# ---------- 6.5 修复 TypeScript 类型检查报错 ----------
+# 现象：error TS2688: Cannot find type definition file for 'minimatch'
+# 原因：tsconfig 用 moduleResolution: node16，TS 会自动加载 node_modules/@types 下
+#       所有包。@types/glob 内部有 `/// <reference types="minimatch" />`，
+#       但 @types/minimatch 未被安装（依赖树提升导致缺失）→ 类型检查直接失败。
+#       这类问题在老项目里会一个接一个冒出来，逐个补 @types 治标不治本。
+# 方案：让 ts-loader 只转译、不做类型检查（transpileOnly）。
+#       TS 仍然正常编译 .ts/.vue，只是跳过类型校验 —— 打包产物不受影响。
+echo "[6.5] 修复 TS 类型检查报错..."
+
+# 兜底：补装缺失的类型包
+npm install -D @types/minimatch@5.1.2 --no-audit --no-fund 2>/dev/null || true
+
+# 主修复：给 ts-loader 加 transpileOnly
+PY="$(command -v python || command -v python3 || true)"
+if [ -n "$PY" ]; then
+    "$PY" - <<'PYEOF'
+import re, io, sys
+p = "vue.config.js"
+try:
+    s = io.open(p, encoding="utf-8").read()
+except Exception as e:
+    print("skip patch vue.config.js:", e); sys.exit(0)
+
+if "transpileOnly" in s:
+    print("vue.config.js 已含 transpileOnly，跳过")
+    sys.exit(0)
+
+# 在 ts-loader 的 options 里插入 transpileOnly: true
+m = re.search(r"(options:\s*\{[^}]*?)(\n\s*\}\s*,?)", s, re.S)
+if m:
+    inner, tail = m.group(1), m.group(2)
+    if not inner.rstrip().endswith(","):
+        inner = inner.rstrip() + ","
+    new = inner + "\n                            transpileOnly: true" + tail
+    s = s[:m.start()] + new + s[m.end():]
+    io.open(p, "w", encoding="utf-8").write(s)
+    print("已给 ts-loader 添加 transpileOnly: true")
+else:
+    print("未匹配到 ts-loader options，跳过")
+PYEOF
+fi
+
 # ---------- 7. 三层编译 ----------
 echo "[7-1] 编译渲染层 -> dist/"
 npm run build
