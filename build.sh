@@ -82,6 +82,20 @@ echo "[3] NODE_OPTIONS 已清空 -> '[$NODE_OPTIONS]'"
 # "Could not determine Node.js install directory"
 npm config set msvs_version 2022 2>/dev/null || true
 
+# 【关键修复】Windows 控制台编码问题
+# 现象：UnicodeEncodeError: 'charmap' codec can't encode characters
+# 原因：Python 3.6+ 在 Windows 上默认用系统 locale 编码（cp1252 / GBK）写 stdout。
+#       node-gyp 编译 node-pty 时会调用 Python 脚本，一旦输出含非 ASCII 字符
+#       （CJK 路径、中文引号、特殊符号）就崩。中文 Windows 机器必现。
+# 方案：强制 Python 全程 UTF-8 + 把控制台代码页切成 65001
+export PYTHONIOENCODING=utf-8
+export PYTHONUTF8=1
+export PYTHONLEGACYWINDOWSSTDIO=utf-8
+echo "[3] PYTHONIOENCODING=$PYTHONIOENCODING  PYTHONUTF8=$PYTHONUTF8"
+
+# 控制台切 UTF-8（Git Bash 下 chcp 可能不存在，容错处理）
+chcp 65001 >/dev/null 2>&1 || true
+
 # ---------- 4. 确保 core（主进程）存在 ----------
 # core 是独立仓库，且被 .gitignore 排除，推代码时极易漏掉
 if [ ! -f "core/package.json" ]; then
@@ -106,7 +120,15 @@ npm install -D electron-rebuild@3.2.9 --no-audit --no-fund
 
 # ---------- 6. 重编原生模块 ----------
 echo "[6] 重编 node-pty / serialport (Electron 17.4.1)..."
-npx electron-rebuild -f -v 17.4.1 -w serialport,node-pty -m .
+# 再次兜底设置（子进程可能不继承上面的 export）
+if npx electron-rebuild -f -v 17.4.1 -w serialport,node-pty -m . ; then
+    echo "[6] 原生模块重编成功"
+else
+    echo "[6] 重编失败，尝试用 UTF-8 环境重试..."
+    PYTHONIOENCODING=utf-8 PYTHONUTF8=1 \
+        npx electron-rebuild -f -v 17.4.1 -w serialport,node-pty -m . \
+        || echo "[6] [警告] 原生模块重编仍失败，继续尝试后续打包（运行时可能缺 node-pty）"
+fi
 
 # ---------- 6.5 修复 TypeScript 类型检查报错 ----------
 # 现象：error TS2688: Cannot find type definition file for 'minimatch'
