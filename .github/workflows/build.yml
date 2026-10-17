@@ -51,24 +51,52 @@ jobs:
           [ -d "$ANDROID_HOME/platforms/android-${COMPILE_SDK}" ] || "$SDKMGR" --install "platforms;android-${COMPILE_SDK}"
           [ -d "$ANDROID_HOME/build-tools/${BUILD_TOOLS}" ] || "$SDKMGR" --install "build-tools;${BUILD_TOOLS}"
 
-      # 自动兼容「仓库根就是项目」或「项目被套在 RainGit-main/ 子目录」两种结构
+      # 仓库里只放了 RainGit-main.zip 时，先解压到 _src
+      - name: Unpack source archive
+        id: unpack
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob nocaseglob
+          zips=( *.zip )
+          if [ "${#zips[@]}" -eq 0 ]; then
+            echo "mode=repo" >> "$GITHUB_OUTPUT"
+            echo "仓库根未发现 zip，按普通源码仓库处理"
+            exit 0
+          fi
+          echo "发现压缩包：${zips[*]}"
+          rm -rf _src
+          mkdir -p _src
+          for z in "${zips[@]}"; do
+            unzip -q -o "$z" -d _src || { echo "::error::解压失败：$z"; exit 1; }
+          done
+          echo "mode=zip" >> "$GITHUB_OUTPUT"
+          echo "解压结果："
+          ls -la _src
+
+      # 兼容：仓库根就是项目 / 解压出来的 RainGit-main/ / 更深层嵌套
       - name: Locate project root
         id: project
         shell: bash
         run: |
           set -euo pipefail
-          if [ -f settings.gradle.kts ] || [ -f settings.gradle ]; then
-            dir="."
-          else
-            hit="$(find . -maxdepth 3 \( -name 'settings.gradle.kts' -o -name 'settings.gradle' \) -print -quit)"
-            dir="$(dirname "$hit")"
-          fi
-          if [ -z "${dir:-}" ] || [ ! -f "$dir/app/build.gradle.kts" ]; then
-            echo "::error::未找到 app 模块，请检查仓库结构（settings.gradle.kts 应在仓库根或 RainGit-main/ 下）"
-            exit 1
-          fi
-          echo "dir=$dir" >> "$GITHUB_OUTPUT"
-          echo "项目根目录：$dir"
+          bases=()
+          if [ "${{ steps.unpack.outputs.mode }}" = "zip" ]; then bases+=("_src"); fi
+          bases+=(".")
+          for base in "${bases[@]}"; do
+            [ -d "$base" ] || continue
+            while IFS= read -r hit; do
+              dir="$(dirname "$hit")"
+              if [ -f "$dir/app/build.gradle.kts" ] || [ -f "$dir/app/build.gradle" ]; then
+                echo "dir=$dir" >> "$GITHUB_OUTPUT"
+                echo "项目根目录：$dir"
+                exit 0
+              fi
+            done < <(find "$base" -maxdepth 5 \( -name 'settings.gradle.kts' -o -name 'settings.gradle' \) -print 2>/dev/null)
+          done
+          echo "::error::未找到 app 模块。当前目录树（前 60 行）："
+          find . -maxdepth 4 -not -path './.git/*' | head -n 60
+          exit 1
 
       - name: Prepare signing (optional)
         id: signing
