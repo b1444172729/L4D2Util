@@ -73,7 +73,17 @@ jobs:
       # Gradle 启动即失败（之前踩过坑）；直接写进 settings 对
       # pluginManagement 同样有效。镜像只做加速，官方源保留在后面兜底。
       # ---------------------------------------------------------------
-      - name: Inject mirror repositories
+      # ---------------------------------------------------------------
+      # 仓库顺序：官方源优先，镜像仅作兜底。
+      #
+      # 教训：之前把阿里云镜像放在最前面，结果解析
+      # org.jetbrains:annotations:23.0.0 时 aliyun/google 返回 502（Bad Gateway），
+      # Gradle 对 5xx 不会自动回退到下一个仓库 —— 整个构建直接失败。
+      #
+      # GitHub Runner 直连 Google / Maven Central 又快又稳，
+      # 所以这里确保官方源在最前；若源码里被注入过镜像，则移除或后置。
+      # ---------------------------------------------------------------
+      - name: Ensure official repositories first
         run: |
           set -euo pipefail
           cd "$GITHUB_WORKSPACE"
@@ -83,16 +93,13 @@ jobs:
           [ -f "$SETTINGS" ] || SETTINGS="${PROJ}/settings.gradle"
           echo "目标文件: $SETTINGS"
 
-          if ! grep -q "maven.aliyun.com" "$SETTINGS"; then
-            # 在每个 repositories { 之后插入阿里云镜像（GNU sed，\n 可换行）
-            sed -i -E 's|^([[:space:]]*)repositories[[:space:]]*\{|\1repositories {\n\1    maven { setUrl("https://maven.aliyun.com/repository/google") }\n\1    maven { setUrl("https://maven.aliyun.com/repository/public") }|' "$SETTINGS"
-          fi
-
-          # 校验：确实写进去了才算成功，否则退回原样继续（官方源兜底）
+          # 工程自带 settings 已含 google() / mavenCentral() / gradlePluginPortal()。
+          # 只做一件事：把任何阿里云镜像行删掉，避免 502 中断构建。
           if grep -q "maven.aliyun.com" "$SETTINGS"; then
-            echo "镜像注入成功"
+            sed -i -E '/maven\.aliyun\.com/d' "$SETTINGS"
+            echo "已移除阿里云镜像（改用官方源，避免 502）"
           else
-            echo "::warning::镜像注入失败，继续使用官方源"
+            echo "未检测到镜像，保持官方源"
           fi
 
           echo "--- 实际生效的 settings ---"
