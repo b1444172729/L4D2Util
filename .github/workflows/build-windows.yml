@@ -1,0 +1,128 @@
+name: Build Windows (WPF)
+
+# 仓库里放的是 SshWin.zip（未解压），本工作流负责解压后编译。
+# WPF 项目只能在 Windows 上构建，因此 runs-on 必须是 windows-latest。
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:      # 允许在 Actions 页面手动触发
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      # ---------- 1. 检出仓库 ----------
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      # ---------- 2. 安装 .NET 8 SDK ----------
+      # 项目是 net8.0-windows（WPF），必须用 .NET 8。
+      # 不显式指定会因 runner 预装版本变化而失败。
+      - name: 安装 .NET 8 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      # ---------- 3. 解压 SshWin.zip ----------
+      # 直接上传的是压缩包，需要先解开。
+      # 写成"搜索任意 *.zip"而不是硬编码文件名，
+      # 这样即使压缩包改名或挪到子目录也能正常构建。
+      - name: 解压源码压缩包
+        shell: bash
+        run: |
+          set -u
+          echo "===== 仓库顶层内容 ====="
+          ls -la
+
+          ZIPS=$(find . -name "*.zip" -not -path "./.git/*")
+          if [ -z "$ZIPS" ]; then
+            echo "错误：仓库里没有找到任何 .zip 压缩包"
+            exit 1
+          fi
+
+          for Z in $ZIPS; do
+            echo "----- 解压: $Z -----"
+            # 优先 unzip；Git Bash 若缺失则用 Windows 内置的 bsdtar（同样支持 zip）
+            if command -v unzip >/dev/null 2>&1; then
+              unzip -o -q "$Z" || tar -xf "$Z"
+            else
+              tar -xf "$Z"
+            fi
+          done
+
+          echo "===== 解压后的目录树（两级） ====="
+          find . -maxdepth 2 -not -path "./.git*" -not -name "*.zip" | sort
+
+      # ---------- 4. 定位解决方案 ----------
+      # 用 find 定位 .sln，避免目录层级变化时写死路径。
+      - name: 定位解决方案文件
+        id: locate
+        shell: bash
+        run: |
+          set -u
+          SLN=$(find . -name "*.sln" -not -path "./.git/*" | head -n 1)
+          if [ -z "$SLN" ]; then
+            echo "错误：解压后未找到 .sln 文件"
+            find . -maxdepth 3 -not -path "./.git*" | sort
+            exit 1
+          fi
+          echo "使用解决方案: $SLN"
+          echo "sln=$SLN" >> "$GITHUB_OUTPUT"
+
+      # ---------- 5. 还原 NuGet 包 ----------
+      # SSH.NET 2023.0.1 / Newtonsoft.Json 在此拉取。
+      - name: 还原 NuGet 包
+        shell: bash
+        run: dotnet restore "${{ steps.locate.outputs.sln }}"
+
+      # ---------- 6. 编译 ----------
+      # 日志重定向到文件而非用 tee：
+      # 之前 Android 工作流里 `| tee` 曾触发 SIGPIPE（exit 141）让构建假失败，
+      # 这里避免同样的写法。
+      - name: 编译 (Release)
+        shell: bash
+        run: |
+          set -u
+          dotnet build "${{ steps.locate.outputs.sln }}" \
+            -c Release --no-restore > build.log 2>&1
+          RC=$?
+          echo "----- 编译日志（末尾 300 行） -----"
+          tail -n 300 build.log
+          echo "----- 错误与警告摘要 -----"
+          grep -E "error |warning " build.log | head -n 60 || true
+          exit $RC
+
+      # ---------- 7. 发布产物 ----------
+      # 输出到 out/，包含 SshAssistant.exe 及其依赖，可直接运行。
+      - name: 发布 (Release)
+        shell: bash
+        run: |
+          set -u
+          dotnet publish "${{ steps.locate.outputs.sln }}" \
+            -c Release -o out --no-restore
+          echo "===== 产物内容 ====="
+          ls -la out
+
+      # ---------- 8. 上传产物 ----------
+      - name: 上传 Windows 可执行文件
+        uses: actions/upload-artifact@v4
+        with:
+          name: SshAssistant-win-x64
+          path: out/
+          if-no-files-found: error
+
+      # ---------- 9. 上传编译日志（失败时便于排查） ----------
+      - name: 上传编译日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: warn
