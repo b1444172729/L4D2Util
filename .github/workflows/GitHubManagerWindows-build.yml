@@ -1,0 +1,301 @@
+name: Build Windows App
+
+# 推送源码包 / Kotlin 文件 / 脚本本身时自动构建，
+# 也可以在 Actions 页面手动点「Run workflow」触发。
+on:
+  push:
+    paths:
+      - '**.zip'
+      - '**.kt'
+      - '**.kts'
+      - 'gradle.properties'
+      - '.github/workflows/build-windows.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    # 必须是 Windows：Compose Desktop 的 exe / msi 走 jpackage 打包，
+    # 只能在目标平台上生成，Linux / macOS 运行器出不来。
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    env:
+      # Windows 默认 GBK，不强制 UTF-8 的话源码里的中文可能变乱码
+      GRADLE_OPTS: -Dfile.encoding=UTF-8
+
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      # ------------------------------------------------------------------
+      # 1. 解压并定位项目目录
+      #    压缩包上传后不会自动解开，且里面还套了一层文件夹，
+      #    所以这里先解压，再递归找到真正的 Gradle 项目根目录。
+      # ------------------------------------------------------------------
+      - name: 解压源码包并定位项目目录
+        id: locate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          shopt -s nullglob nocaseglob
+          zips=( *.zip )
+
+          if [ ${#zips[@]} -gt 0 ]; then
+            echo "发现 ${#zips[@]} 个压缩包：${zips[*]}"
+            rm -rf _src && mkdir -p _src
+            for z in "${zips[@]}"; do
+              echo "解压：$z"
+              if command -v unzip >/dev/null 2>&1; then
+                unzip -q -o "$z" -d _src
+              else
+                # 兜底：Git Bash 万一没有 unzip，用 Python 的 zipfile
+                python -m zipfile -e "$z" _src/
+              fi
+            done
+            base="_src"
+          else
+            echo "未发现压缩包，假定仓库根目录就是项目"
+            base="."
+          fi
+
+          # 递归查找：必须同时有 settings.gradle.kts 与 build.gradle.kts，
+          # 避免误判到某个只有其一的子目录。
+          dir=""
+          while IFS= read -r hit; do
+            cand="$(dirname "$hit")"
+            if [ -f "$cand/build.gradle.kts" ] || [ -f "$cand/build.gradle" ]; then
+              dir="$cand"
+              break
+            fi
+          done < <(find "$base" -maxdepth 6 \( -name 'settings.gradle.kts' -o -name 'settings.gradle' \) -print)
+
+          if [ -z "$dir" ]; then
+            echo "::error::未找到项目目录（需要同时含 settings.gradle.kts 与 build.gradle.kts）"
+            echo "----- _src 目录树 -----"
+            find "$base" -maxdepth 4 2>/dev/null | head -60
+            exit 1
+          fi
+
+          echo "项目目录：$dir"
+          echo "----- 目录内容 -----"
+          ls -la "$dir"
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+
+      # ------------------------------------------------------------------
+      # 2. 环境：JDK 17 + Gradle 8.7
+      #    jpackage 要求 JDK 17+，低版本打包会直接失败。
+      # ------------------------------------------------------------------
+      - name: 安装 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: 安装 Gradle 8.7
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      # ------------------------------------------------------------------
+      # 3. 准备 WiX（生成 exe / msi 安装包需要）
+      #    windows-latest 镜像一般自带 WiX；即便没有，Compose 插件也会
+      #    自动下载 wix311。这一步只是把预装路径显式加进 PATH，尽力而为。
+      # ------------------------------------------------------------------
+      - name: 准备 WiX 工具集
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $wix = $env:WIX
+          if ($wix) {
+            $wix = $wix.TrimEnd('\', '/')
+            if (Test-Path (Join-Path $wix 'bin')) {
+              (Join-Path $wix 'bin') | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+              Write-Host "已把预装 WiX 加入 PATH：$(Join-Path $wix 'bin')"
+            }
+          } else {
+            Write-Host "未检测到预装 WiX，交由 Compose 插件自动下载"
+          }
+
+      # ------------------------------------------------------------------
+      # 4. 打包 exe（主产物，必须成功）
+      #    源码包里没有 gradlew，所以直接用已安装的 gradle。
+      # ------------------------------------------------------------------
+      - name: 打包 exe
+        shell: bash
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: |
+          set -euo pipefail
+          CMD=gradle
+          command -v gradle >/dev/null 2>&1 || CMD=gradle.bat
+          echo "使用命令：$CMD"
+          # --info：jpackage 失败时 Gradle 默认只报「exit code 1」，
+          # 加 --info 才能看到 jpackage 的完整命令行与部分内部输出
+          $CMD --no-daemon --console=plain --info packageExe
+
+      # ------------------------------------------------------------------
+      # 5. 打包 msi（可选，失败不影响整体）
+      # ------------------------------------------------------------------
+      - name: 打包 msi
+        id: msi
+        shell: bash
+        continue-on-error: true
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: |
+          set -euo pipefail
+          CMD=gradle
+          command -v gradle >/dev/null 2>&1 || CMD=gradle.bat
+          $CMD --no-daemon --console=plain packageMsi
+
+      # ------------------------------------------------------------------
+      # 6. 兜底：若安装包装不出来，至少产出一个可直接运行的程序目录
+      # ------------------------------------------------------------------
+      - name: 兜底生成可运行程序目录
+        if: failure()
+        shell: bash
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: |
+          set -euo pipefail
+          CMD=gradle
+          command -v gradle >/dev/null 2>&1 || CMD=gradle.bat
+          $CMD --no-daemon --console=plain createDistributable || true
+          if [ -d build/compose/binaries/main-release/app ]; then
+            (cd build/compose/binaries/main-release/app && zip -q -r ../../../GitHubManager-app.zip .)
+            echo "已生成 app 压缩包"
+          fi
+
+      # ------------------------------------------------------------------
+      # 6.5 把 jpackage 自己写的错误日志打出来
+      #     Gradle 只会说「External tool execution failed / Exit code: 1」，
+      #     jpackage 真正的报错被写进了 build/compose/logs/<task>/ 下的两个文件，
+      #     不打出来就只能瞎猜。
+      # ------------------------------------------------------------------
+      - name: 输出 jpackage 错误日志
+        if: failure()
+        shell: bash
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: |
+          set +e
+          echo "========== jpackage 日志文件清单 =========="
+          find build/compose/logs -type f 2>/dev/null | head -20
+          echo
+          for f in $(find build/compose/logs -type f -name '*err.txt' 2>/dev/null | head -5); do
+            echo "========== [STDERR] $f =========="
+            cat "$f"
+            echo
+          done
+          for f in $(find build/compose/logs -type f -name '*out.txt' 2>/dev/null | head -5); do
+            echo "========== [STDOUT] $f =========="
+            tail -60 "$f"
+            echo
+          done
+          echo "========== jpackage 参数文件 =========="
+          for f in $(find build/compose/tmp -type f -name '*.args.txt' 2>/dev/null | head -5); do
+            echo "--- $f ---"
+            cat "$f"
+            echo
+          done
+
+      # ------------------------------------------------------------------
+      # 6.6 终极兜底：不管打包成败，都产出一个能双击运行的 zip
+      #     内容是 应用jar + 依赖 + 启动脚本，需要本机装了 JDK 17。
+      # ------------------------------------------------------------------
+      - name: 生成可运行 jar 包（终极兜底）
+        if: always()
+        shell: bash
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: |
+          set -euo pipefail
+          CMD=gradle
+          command -v gradle >/dev/null 2>&1 || CMD=gradle.bat
+          $CMD --no-daemon --console=plain jar || true
+
+          OUT=build/GitHubManager-runnable
+          rm -rf "$OUT" && mkdir -p "$OUT/lib"
+
+          # 主 jar
+          JAR=$(find build/libs -maxdepth 1 -name '*.jar' ! -name '*sources*' | head -1)
+          if [ -z "$JAR" ]; then echo "::warning::没找到主 jar，跳过兜底产物"; exit 0; fi
+          cp "$JAR" "$OUT/GitHubManager.jar"
+          echo "主 jar：$JAR"
+
+          # 运行时依赖
+          $CMD --no-daemon --console=plain -q printRuntimeClasspath 2>/dev/null > /tmp/cp.txt || true
+          if [ -s /tmp/cp.txt ]; then
+            tr ':' '\n' < /tmp/cp.txt | grep '\.jar$' | while read -r j; do
+              [ -f "$j" ] && cp "$j" "$OUT/lib/" || true
+            done
+          fi
+
+          cat > "$OUT/运行.bat" <<'BAT'
+          @echo off
+          chcp 65001 >nul
+          java -version >nul 2>&1 || (echo 需要先安装 JDK 17：https://adoptium.net/ & pause & exit /b 1)
+          java -cp "GitHubManager.jar;lib/*" com.githubmanager.desktop.MainKt
+          pause
+          BAT
+
+          (cd "$OUT" && zip -q -r ../../GitHubManager-runnable.zip .)
+          echo "已生成：build/GitHubManager-runnable.zip"
+
+      # ------------------------------------------------------------------
+      # 7. 校验并上传
+      # ------------------------------------------------------------------
+      - name: 校验产物
+        id: verify
+        shell: bash
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: |
+          set -euo pipefail
+          found=$(find build/compose/binaries -type f \( -name '*.exe' -o -name '*.msi' \) 2>/dev/null || true)
+          if [ -z "$found" ]; then
+            echo "::error::未生成任何 exe / msi"
+            find build -maxdepth 5 -type d 2>/dev/null | head -40
+            exit 1
+          fi
+          echo "产物清单："
+          echo "$found"
+
+      - name: 上传安装包
+        uses: actions/upload-artifact@v4
+        with:
+          name: GitHubManager-Windows
+          path: |
+            ${{ steps.locate.outputs.dir }}/build/compose/binaries/main-release/exe/*.exe
+            ${{ steps.locate.outputs.dir }}/build/compose/binaries/main-release/msi/*.msi
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: 上传可运行 jar 包（无需安装即可运行）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: GitHubManager-Windows-Runnable
+          path: ${{ steps.locate.outputs.dir }}/build/GitHubManager-runnable.zip
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: 上传可运行程序目录（兜底）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: GitHubManager-Windows-AppDir
+          path: ${{ steps.locate.outputs.dir }}/build/compose/binaries/GitHubManager-app.zip
+          if-no-files-found: ignore
+          retention-days: 30
+
+      # ------------------------------------------------------------------
+      # 8. 编译失败时，把 Kotlin 报错单独摘出来，省得翻几百行日志
+      # ------------------------------------------------------------------
+      - name: 输出 Kotlin 编译错误
+        if: failure()
+        shell: bash
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: |
+          set +e
+          CMD=gradle
+          command -v gradle >/dev/null 2>&1 || CMD=gradle.bat
+          echo "========== e: 开头的编译错误 =========="
+          $CMD --no-daemon --console=plain compileKotlin 2>&1 | grep -E "^e: " | head -40
+          echo "========== 依赖解析错误 =========="
+          $CMD --no-daemon --console=plain compileKotlin 2>&1 | grep -iE "Could not (resolve|find)|Couldn't resolve|not found" | head -20
