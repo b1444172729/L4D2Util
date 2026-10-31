@@ -1,0 +1,210 @@
+name: Build AdbWifi APK
+
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: '构建类型'
+        required: true
+        default: 'debug'
+        type: choice
+        options:
+          - debug
+          - release
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. 检出 ──────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── 2. JDK 17 ────────────────────────────────
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # ── 3. Android SDK：只补缺，不全量装 ──────────
+      - name: Set up Android SDK
+        run: |
+          set -e
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          echo "SDK = $SDK"
+          echo "ANDROID_HOME=$SDK"     >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+
+          SM=$(ls -1 "$SDK"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | head -1 || true)
+          [ -z "$SM" ] && SM=$(command -v sdkmanager || true)
+          if [ -z "$SM" ]; then echo "::error::找不到 sdkmanager"; exit 1; fi
+          echo "SM_DIR=$(dirname "$SM")" >> "$GITHUB_ENV"
+          export PATH="$(dirname "$SM"):$PATH"
+
+          # 预置 license 哈希，避免卡在 Accept? (y/N)
+          mkdir -p "$SDK/licenses"
+          printf '\n24333f8a63b6825ea9c5514f83c2829b004d1fee\n8933bad161af4178b1185d1a37fbf41ea5269c55\n' > "$SDK/licenses/android-sdk-license"
+          printf '\n84831b9409646a918e30573bab4c9c91346d8abd\n' > "$SDK/licenses/android-sdk-preview-license"
+
+          NEED=""
+          [ -d "$SDK/platforms/android-34"  ] || NEED="$NEED platforms;android-34"
+          [ -d "$SDK/build-tools/34.0.0"    ] || NEED="$NEED build-tools;34.0.0"
+          [ -d "$SDK/platform-tools"        ] || NEED="$NEED platform-tools"
+          if [ -z "$NEED" ]; then
+            echo "组件齐全，跳过安装"
+          else
+            echo "待安装:$NEED"
+            yes 2>/dev/null | sdkmanager --licenses >/dev/null 2>&1 || true
+            sdkmanager --install $NEED
+          fi
+          ls "$SDK/platforms" | tr '\n' ' '; echo
+          ls "$SDK/build-tools" | tr '\n' ' '; echo
+
+      # ── 4. 定位源码：压缩包 or 直接解压的目录都支持 ──
+      - name: Locate and prepare source
+        id: src
+        run: |
+          python3 - <<'PY'
+          import os, zipfile, sys
+
+          root = os.environ['GITHUB_WORKSPACE']
+          src_out = os.path.join(root, '__src')
+
+          def find_all(base, pred):
+              hits = []
+              for d, dirs, files in os.walk(base):
+                  dirs[:] = [x for x in dirs if x not in ('.git', '__src', 'build', '.gradle')]
+                  for f in files:
+                      p = os.path.join(d, f)
+                      if pred(p, f):
+                          hits.append(p)
+              return hits
+
+          def emit(k):
+              with open(os.environ['GITHUB_OUTPUT'], 'a') as fh:
+                  fh.write(f"{k}\n")
+
+          def fail(msg):
+              print(f"::error::{msg}")
+              print("---- 仓库中被 git 跟踪的文件 ----")
+              import subprocess
+              r = subprocess.run(['git', 'ls-files'], cwd=root, capture_output=True, text=True)
+              print(r.stdout[:4000])
+              sys.exit(1)
+
+          # 1) 找压缩包：优先 adbwifi*.zip，其次任意 zip（排除 gradle 分发包）
+          zips = find_all(root, lambda p, f: f.lower().endswith('.zip'))
+          pref = [z for z in zips if os.path.basename(z).lower().startswith('adbwifi')]
+          zips = pref or [z for z in zips if 'gradle' not in z.lower()]
+
+          project = None
+          if zips:
+              z = sorted(zips, key=os.path.getsize, reverse=True)[0]
+              print(f"使用压缩包: {os.path.relpath(z, root)}")
+              os.makedirs(src_out, exist_ok=True)
+              with zipfile.ZipFile(z) as zf:
+                  zf.extractall(src_out)
+              print(f"解压完成，条目数: {len(zf.namelist())}")
+          else:
+              print("仓库中没有 .zip，尝试直接使用已解压的源码")
+
+          # 2) 无论套几层，找 settings.gradle 定位工程根
+          bases = [src_out] if os.path.isdir(src_out) else []
+          bases.append(root)
+          cands = []
+          for b in bases:
+              for d, dirs, files in os.walk(b):
+                  dirs[:] = [x for x in dirs if x not in ('.git', 'build', '.gradle')]
+                  if 'settings.gradle' in files or 'settings.gradle.kts' in files:
+                      cands.append(d)
+          # 去掉 __src 之外的重复，取最浅的
+          if not cands:
+              fail("未找到 settings.gradle，压缩包/仓库里没有可识别的 Android 工程")
+          project = sorted(cands, key=lambda p: p.count(os.sep))[0]
+          print(f"工程根目录: {os.path.relpath(project, root)}")
+
+          # 3) 校验关键文件
+          must = [
+              'app/src/main/AndroidManifest.xml',
+              'app/src/main/java/com/android/adbwifi/MainActivity.kt',
+          ]
+          for m in must:
+              fp = os.path.join(project, m)
+              if not os.path.isfile(fp):
+                  fail(f"缺少关键文件: {m}")
+              print(f"  OK  {m}")
+
+          # 4) gradlew 可执行
+          gw = os.path.join(project, 'gradlew')
+          if os.path.isfile(gw):
+              os.chmod(gw, 0o755)
+              print("gradlew 已赋予可执行权限")
+          else:
+              print("::warning::未找到 gradlew，将使用系统 gradle")
+
+          emit(f"project={project}")
+          PY
+
+      # ── 5. 构建 ──────────────────────────────────
+      - name: Grant execute permission for gradlew
+        run: chmod +x "${{ steps.src.outputs.project }}/gradlew" || true
+
+      - name: Build APK
+        working-directory: ${{ steps.src.outputs.project }}
+        run: |
+          set -e
+          TYPE="${{ github.event.inputs.build_type || 'debug' }}"
+          CAP="$(python3 -c "print('$TYPE'.capitalize())")"
+          echo "构建任务: :app:assemble${CAP}"
+          if [ -f gradle/wrapper/gradle-wrapper.jar ]; then
+            ./gradlew --no-daemon --stacktrace :app:assemble${CAP}
+          else
+            echo "::warning::缺少 gradle-wrapper.jar，回退系统 gradle"
+            gradle --no-daemon :app:assemble${CAP}
+          fi
+
+      # ── 6. 收集产物 ──────────────────────────────
+      - name: Collect APK
+        run: |
+          set -e
+          TYPE="${{ github.event.inputs.build_type || 'debug' }}"
+          mkdir -p out
+          APK="$(find "${{ steps.src.outputs.project }}" -path '*/app/build/outputs/apk/*' -name '*.apk' | head -1)"
+          [ -z "$APK" ] && { echo "::error::未生成 APK"; exit 1; }
+          echo "产物: $APK"
+          cp "$APK" "out/无线调试-$TYPE.apk"
+          cp "$APK" "out/adbwifi-$TYPE.apk"
+          ls -la out
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: adbwifi-apk
+          path: out/*.apk
+          compression-level: 9
+          retention-days: 90
+
+      # ── 7. 打 tag 时发 Release ───────────────────
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/*.apk
+          name: 无线调试 ${{ github.ref_name }}
+          body: |
+            自动构建产物（GitHub Actions）
+            - 包名：`com.android.adbwifi`
+            - 构建类型：${{ github.event.inputs.build_type || 'debug' }}
+
+            首次使用如需开关无线调试，请先授权：
+            ```
+            adb shell pm grant com.android.adbwifi android.permission.WRITE_SECURE_SETTINGS
+            ```
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
