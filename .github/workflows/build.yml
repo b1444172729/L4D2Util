@@ -1,0 +1,118 @@
+name: 编译 ShizukuVolumePanel APK
+
+# 触发方式：
+#  1) 上传/更新 ShizukuVolumePanel.zip 或本文件后 push
+#  2) Actions 页面手动点 "Run workflow"
+on:
+  push:
+    paths:
+      - 'ShizukuVolumePanel.zip'
+      - '.github/workflows/build.yml'
+  pull_request:
+    paths:
+      - 'ShizukuVolumePanel.zip'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      # 压缩包里套了一层 ShizukuVolumePanel/ 文件夹，
+      # 这里解压后自动找含 settings.gradle.kts 的目录，套几层都不怕。
+      - name: 定位并解压源码包
+        id: unpack
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP="$(find . -maxdepth 1 -type f -name 'ShizukuVolumePanel.zip' -print -quit)"
+          if [ -z "$ZIP" ]; then
+            ZIP="$(find . -maxdepth 1 -type f -name '*.zip' -print -quit)"
+          fi
+          if [ -z "$ZIP" ]; then
+            echo "::error::仓库根目录找不到 ShizukuVolumePanel.zip"
+            exit 1
+          fi
+          echo "使用压缩包: $ZIP"
+          rm -rf "$RUNNER_TEMP/src"
+          mkdir -p "$RUNNER_TEMP/src"
+          unzip -q "$ZIP" -d "$RUNNER_TEMP/src"
+
+          SETTINGS="$(find "$RUNNER_TEMP/src" -type f -name 'settings.gradle.kts' -print -quit)"
+          if [ -z "$SETTINGS" ]; then
+            echo "::error::解压后找不到 settings.gradle.kts，压缩包结构可能不对"
+            find "$RUNNER_TEMP/src" -maxdepth 3 -print
+            exit 1
+          fi
+          PROJECT_DIR="$(dirname "$SETTINGS")"
+          echo "工程目录: $PROJECT_DIR"
+          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: 安装 SDK 组件并接受许可
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager --install "platforms;android-35" "build-tools;35.0.0" "platform-tools"
+
+      # AGP 8.7.3 最低要求 Gradle 8.9；工程不带 gradle-wrapper.jar，直接用系统 Gradle
+      - name: Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: 兜底检查 gradle 命令
+        shell: bash
+        run: |
+          if ! command -v gradle >/dev/null 2>&1; then
+            echo "setup-gradle 未把 gradle 加入 PATH，手动安装 8.9"
+            curl -sSL -o /tmp/gradle.zip https://services.gradle.org/distributions/gradle-8.9-bin.zip
+            unzip -q /tmp/gradle.zip -d /opt
+            echo "/opt/gradle-8.9/bin" >> "$GITHUB_PATH"
+          fi
+
+      - name: 编译 Debug APK
+        working-directory: ${{ steps.unpack.outputs.project_dir }}
+        shell: bash
+        run: |
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+          gradle --version
+          gradle assembleDebug --no-daemon --stacktrace
+
+      - name: 收集产物
+        shell: bash
+        run: |
+          set -euo pipefail
+          PROJECT_DIR="${{ steps.unpack.outputs.project_dir }}"
+          APK="$(find "$PROJECT_DIR" -path '*/app/build/outputs/apk/debug/*.apk' -print -quit)"
+          if [ -z "$APK" ]; then
+            echo "::error::没找到 debug APK"
+            find "$PROJECT_DIR/app/build" -maxdepth 6 -type f | head -60 || true
+            exit 1
+          fi
+          mkdir -p "$GITHUB_WORKSPACE/output"
+          cp "$APK" "$GITHUB_WORKSPACE/output/ShizukuVolumePanel-debug.apk"
+          ls -lh "$GITHUB_WORKSPACE/output/ShizukuVolumePanel-debug.apk"
+
+      - name: 上传 APK（在运行页底部下载）
+        uses: actions/upload-artifact@v4
+        with:
+          name: ShizukuVolumePanel-debug
+          path: output/ShizukuVolumePanel-debug.apk
+          if-no-files-found: error
+          retention-days: 30
