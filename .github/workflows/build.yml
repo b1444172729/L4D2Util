@@ -1,0 +1,662 @@
+# 限量网关 · GitHub Actions 编译脚本（r11 / Node 22 + JNI + 散放源码）
+#
+# r11 = r5（真机验证能聊天的 Node 22.23.2 + 自建 JNI 胶水）
+#     + r6（零 node_modules / 源码散放 / 裁剪 / 应用内更新）
+#     + r7（assets/node 体积硬闸门 + 自动体积清单）
+#     + r8（llvm-strip libnode.so + 跳过重复 icudtl.dat）
+# 不引入 Bun 二进制：运行时仍是 CI 从 GitHub Release 下载的 libnode.so，
+# 溯源链见「放置 nodejs-mobile 的 libnode.so」与「运行时版本闸门」两步。
+#
+# 放置位置（硬性要求）：仓库根目录 .github/workflows/build.yml，明文提交。
+#   ⚠️ GitHub 只识别「已提交的明文 YAML」，压缩包里的 workflow 永远不会被触发。
+#
+# 仓库结构：
+#   repo/
+#   ├── .github/workflows/build.yml   ← 本文件，明文提交
+#   └── dsh_free_model_app.zip        ← 完整工程包（里面套一层 aggregate-gateway/）
+#
+# 重要：dsh_free_model_app.zip 必须是【完整工程】，不能只放改动文件。
+#       本脚本不再做增量叠加或历史回溯 —— 那样依赖仓库历史，太脆弱。
+#
+# 产出：Artifacts 里的 AggregateGateway-*.apk（默认 debug，AGP 自动签名，可直接安装）
+
+name: 构建限量网关 APK
+
+on:
+  push:
+    paths:
+      - 'dsh_free_model_app.zip'
+      - '**/dsh_free_model_app.zip'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: '构建类型（debug 可直接安装；release 为未签名包）'
+        required: false
+        default: 'debug'
+        type: choice
+        options: [debug, release, both]
+      skip_bundle:
+        description: '跳过生成散放上游源码（快速验证壳能否编译）'
+        required: false
+        default: false
+        type: boolean
+      libnode_url:
+        description: 'Android arm64 产物 zip 直链（留空=默认 Node 22+ 运行时；上游要求 ^22.19.0 || >=24.0.0）'
+        required: false
+        default: ''
+        type: string
+      libnode_sha256:
+        description: '上述 zip 的 SHA-256（可选）'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GRADLE_VERSION: '8.9'
+  JAVA_VERSION: '17'
+  NODE_VERSION: '22'
+  COMPILE_SDK: '35'
+  BUILD_TOOLS: '35.0.0'
+  BUILD_TYPE: ${{ inputs.build_type || 'debug' }}
+  SKIP_BUNDLE: ${{ inputs.skip_bundle }}
+  LIBNODE_URL: ${{ inputs.libnode_url || vars.NODE_MOBILE_URL || '' }}
+  LIBNODE_SHA256: ${{ inputs.libnode_sha256 || vars.NODE_MOBILE_SHA256 || '' }}
+  GH_TOKEN: ${{ github.token }}
+  # r8：确为 small-icu 构建时设为 1，才会把外部 icudtl.dat 打进 assets
+  KEEP_EXTERNAL_ICU: ${{ vars.KEEP_EXTERNAL_ICU || '0' }}
+
+jobs:
+  build:
+    name: 解压 → 准备运行时 → 编译 APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      # -------------------------------------------------------------- 1
+      - name: 检出仓库
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      # -------------------------------------------------------------- 2
+      # 解压并定位工程：不假定套了几层、不假定目录名。
+      # 判据：同时存在 settings.gradle.kts 与 app/build.gradle.kts。
+      # 打印每个 zip 的完整文件清单，传错包时一眼可查。
+      - name: 解压 dsh_free_model_app.zip 并定位工程
+        shell: bash
+        run: |
+          set -euo pipefail
+          WS="${GITHUB_WORKSPACE}"
+          OUT="$WS/_unpacked"
+          rm -rf "$OUT"; mkdir -p "$OUT"
+
+          mapfile -t ZIPS < <(find "$WS" -maxdepth 1 -type f -name '*.zip' -print | sort)
+          echo "仓库根目录 zip 数量：${#ZIPS[@]}"
+          if [ "${#ZIPS[@]}" -eq 0 ]; then
+            echo "::error::仓库根目录没有任何 .zip 文件"
+            exit 1
+          fi
+
+          idx=0
+          for z in "${ZIPS[@]}"; do
+            idx=$((idx + 1))
+            d="$OUT/zip$idx"
+            mkdir -p "$d"
+            echo "::group::解压 $(basename "$z")"
+            if ! unzip -q -o "$z" -d "$d"; then
+              echo "::error::$(basename "$z") 解压失败"
+              echo "::endgroup::"
+              exit 1
+            fi
+            find "$d" -type d -name '__MACOSX' -prune -exec rm -rf {} + 2>/dev/null || true
+            echo "内容清单（最多 80 项）："
+            (cd "$d" && find . -type f | sed 's|^\./||' | sort | head -80)
+            echo "文件总数：$(find "$d" -type f | wc -l | tr -d ' ')"
+            echo "::endgroup::"
+          done
+
+          # ------------------------------------------------------------
+          # ★ 关键：归一化解压文件的 mtime。
+          #
+          # ZIP 格式保存的是「本地时间且不带时区」。在东八区打包的源码，
+          # 在 UTC 的 GitHub runner 上解压后，mtime 会被解释成「未来 8 小时」。
+          # 于是 CMake 生成的 build.ninja（当前时间）永远比 CMakeLists.txt /
+          # dsh-node.c 旧，Ninja 判定 manifest dirty → 反复 Re-running CMake
+          # → 重生成内容相同、mtime 不变 → 循环 100 次后报：
+          #   ninja: error: manifest 'build.ninja' still dirty after 100 tries
+          # 把所有源码文件统一设成 2000-01-01 UTC，保证构建产物严格更新。
+          # ------------------------------------------------------------
+          echo "::group::归一化源码文件时间戳（防止未来时间戳）"
+          echo "当前时间(UTC)      : $(date -u '+%Y-%m-%d %H:%M:%S')"
+          echo "归一化前最晚 mtime : $(find "$OUT" -type f -printf '%TY-%Tm-%Td %TH:%TM:%TS %p\n' 2>/dev/null | sort | tail -n1)"
+          find "$OUT" -type f -exec touch -d '2000-01-01 00:00:00 UTC' {} +
+          echo "归一化后最晚 mtime : $(find "$OUT" -type f -printf '%TY-%Tm-%Td %TH:%TM:%TS %p\n' 2>/dev/null | sort | tail -n1)"
+          echo "已统一为 2000-01-01 UTC，CMake/Ninja 不会再误判 manifest dirty。"
+          echo "::endgroup::"
+
+          PROJECT_DIR=""
+          while IFS= read -r s; do
+            [ -z "$s" ] && continue
+            p="$(dirname "$s")"
+            if [ -f "$p/app/build.gradle.kts" ]; then
+              PROJECT_DIR="$p"
+              break
+            fi
+          done < <(find "$OUT" "$WS" -maxdepth 12 -type f -name 'settings.gradle.kts' \
+            -not -path '*/.git/*' -not -path '*__MACOSX*' -print 2>/dev/null || true)
+
+          if [ -z "$PROJECT_DIR" ]; then
+            echo "::error::没找到完整 Android 工程（需同时有 settings.gradle.kts 与 app/build.gradle.kts）。"
+            echo "::error::dsh_free_model_app.zip 必须是【完整工程包】，不能只放改动文件。"
+            echo "::error::正确结构：zip 里套一层 aggregate-gateway/，内含 settings.gradle.kts、app/、res/ 等全部源码。"
+            echo "::error::上面已打印各 zip 的完整清单，可据此核对缺了什么。"
+            exit 1
+          fi
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "ZIP_USED=${ZIPS[*]:-none}"    >> "$GITHUB_ENV"
+          echo "工程目录：$PROJECT_DIR"
+          echo "工程文件数：$(find "$PROJECT_DIR" -type f | wc -l | tr -d ' ')"
+          echo "顶层内容："
+          ls -la "$PROJECT_DIR" | sed -n '1,25p'
+
+      # -------------------------------------------------------------- 3
+      - name: 安装 JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      # -------------------------------------------------------------- 4
+      # 不用 android-actions/setup-android@v3：它默认要装早已下架的 `tools` 包，
+      # 在 2026 新 runner（预装 cmdline-tools 20.0）上必然 "Failed to find package 'tools'"。
+      # GitHub ubuntu 镜像自带完整 Android SDK，直接用预装的 sdkmanager 即可。
+      - name: 配置 Android SDK 并安装 platform / build-tools
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          if [ -z "$SDK_ROOT" ] || [ ! -d "$SDK_ROOT" ]; then
+            for c in /usr/local/lib/android/sdk /opt/android-sdk "$HOME/Android/Sdk"; do
+              [ -d "$c" ] && { SDK_ROOT="$c"; break; }
+            done
+          fi
+          if [ -z "$SDK_ROOT" ] || [ ! -d "$SDK_ROOT" ]; then
+            echo "::error::找不到预装 Android SDK"
+            exit 1
+          fi
+          echo "SDK_ROOT = $SDK_ROOT"
+
+          SDKMGR=""
+          for c in \
+            "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" \
+            "$SDK_ROOT/cmdline-tools/bin/sdkmanager" \
+            "$SDK_ROOT/tools/bin/sdkmanager"; do
+            [ -x "$c" ] && { SDKMGR="$c"; break; }
+          done
+          if [ -z "$SDKMGR" ]; then
+            SDKMGR="$(find "$SDK_ROOT/cmdline-tools" -maxdepth 3 -type f \
+              -name sdkmanager -perm -u+x 2>/dev/null | sort -V | tail -n1 || true)"
+          fi
+          if [ -z "$SDKMGR" ]; then SDKMGR="$(command -v sdkmanager || true)"; fi
+          if [ -z "$SDKMGR" ] || [ ! -x "$SDKMGR" ]; then
+            echo "::error::$SDK_ROOT 下没有可用的 sdkmanager"
+            exit 1
+          fi
+          echo "sdkmanager = $SDKMGR"
+          "$SDKMGR" --version || true
+
+          # pipefail 下 yes 被 SIGPIPE 打断是正常现象，整条兜底
+          yes | "$SDKMGR" --sdk_root="$SDK_ROOT" --licenses >/dev/null 2>&1 || true
+
+          # 只装明确存在的三个包；绝不要装已下架的 `tools`
+          ok=0
+          for i in 1 2 3; do
+            if "$SDKMGR" --sdk_root="$SDK_ROOT" --install \
+              "platforms;android-${COMPILE_SDK}" \
+              "build-tools;${BUILD_TOOLS}" \
+              "platform-tools"; then
+              ok=1
+              break
+            fi
+            echo "::warning::SDK 组件安装第 $i 次失败，10 秒后重试…"
+            sleep 10
+          done
+          if [ "$ok" != 1 ]; then
+            echo "::error::SDK 组件安装失败"
+            exit 1
+          fi
+
+          # 自建 JNI 胶水需要 NDK + CMake。镜像通常已预装，缺失才安装，
+          # 避免每次都下载上 GB 的 NDK 拖慢编译。
+          NDK_VER="27.0.12077973"
+          CMAKE_VER="3.22.1"
+          NEED=""
+          [ -d "$SDK_ROOT/ndk/$NDK_VER" ] || NEED="$NEED ndk;$NDK_VER"
+          [ -x "$SDK_ROOT/cmake/$CMAKE_VER/bin/cmake" ] || NEED="$NEED cmake;$CMAKE_VER"
+          if [ -n "$NEED" ]; then
+            echo "需要补装原生工具链：$NEED"
+            # shellcheck disable=SC2086
+            "$SDKMGR" --sdk_root="$SDK_ROOT" --install $NEED || {
+              echo "::error::NDK/CMake 安装失败，无法编译 app/src/main/cpp 下的胶水"
+              exit 1
+            }
+          else
+            echo "NDK $NDK_VER 与 CMake $CMAKE_VER 已预装，跳过"
+          fi
+          echo "  NDK  : $([ -d "$SDK_ROOT/ndk/$NDK_VER" ] && echo 已就位 || echo 缺失)"
+          echo "  CMake: $([ -x "$SDK_ROOT/cmake/$CMAKE_VER/bin/cmake" ] && echo 已就位 || echo 缺失)"
+
+          echo "ANDROID_HOME=$SDK_ROOT"      >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "已写入 ANDROID_HOME / ANDROID_SDK_ROOT = $SDK_ROOT"
+
+      # -------------------------------------------------------------- 5
+      - name: 安装 Node.js（用于生成散放上游源码）
+        if: env.SKIP_BUNDLE != 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      # -------------------------------------------------------------- 6
+      # oc-proot-gateway-r5d：不再 clone GitHub 上游，脚本只做离线校验 + 刷新
+      # bundle-version.txt，绝不覆盖内置的三个 .cjs。
+      - name: 校验 proot 桥接网关源码（离线）
+        if: env.SKIP_BUNDLE != 'true'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x "$PROJECT_DIR/scripts/prepare-node-bundle.sh"
+          bash "$PROJECT_DIR/scripts/prepare-node-bundle.sh" "$PROJECT_DIR/.ofm-src"
+
+      # -------------------------------------------------------------- 7
+      # Java 桥接层已由本工程自编（app/src/main/cpp + NodeBridge.java），
+      # 这里只需要官方的 libnode.so；不再需要任何 aar。
+      - name: 放置 nodejs-mobile 的 libnode.so
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL="$LIBNODE_URL"
+          if [ -n "$URL" ]; then
+            echo "运行时来源：手动指定 / 仓库变量 $URL"
+            echo "::notice::该值来自 inputs.libnode_url 或 vars.NODE_MOBILE_URL，优先级高于默认探测。"
+          else
+            # ★ 上游 packages/standalone 根 package.json 声明
+            #   engines.node = "^22.19.0 || >=24.0.0"；cli.mjs 在 v18 下会抛
+            #   "Cannot read properties of undefined (reading 'bind')" 后不 listen。
+            #
+            # ★ r4 修复（本轮日志实证）：旧探测是
+            #     .[] | .assets[] | test("android-libnode") | head -n1
+            #   它命中了 OpenFlun 仓库**最早的 v18.20.4 基线 release**——那个
+            #   release 同样带 android-libnode.zip，但里面是 59.6 MB 的 v18 .so。
+            #   于是闸门拦下、job 变红，却白跑了一整轮。现在强制按 tag 的
+            #   major >= 22 过滤，且**不再回退 v18**（v18 包注定跑不起来，
+            #   与其产出废 APK 不如直接让 job 失败并给出直链）。
+            echo "未指定 URL，默认采用 Node 22+ 运行时（OpenFlun/nodejs-mobile）…"
+            URL="$(gh api repos/OpenFlun/nodejs-mobile/releases \
+              --jq '[.[] | select(.tag_name | test("^v?(2[2-9]|[3-9][0-9])\\.")) | .tag_name as $t | .assets[]? | select(.name | test("^android-libnode")) | {tag: $t, url: .browser_download_url}] | .[0].url // empty' \
+              2>/dev/null || true)"
+            if [ -n "$URL" ]; then
+              echo "默认探测命中（Node 22+）：$URL"
+            else
+              echo "::error::未能从 OpenFlun/nodejs-mobile 找到 major>=22 的 android-libnode.zip。"
+              echo "::error::旧探测会误取 v18.20.4 基线 release；本版已禁止回退 v18。"
+              echo "::error::请在 Run workflow 里把 libnode_url 填成以下任一 release 的 android-libnode.zip 直链："
+              echo "::error::  GitHub : https://github.com/OpenFlun/nodejs-mobile/releases  （tag v22.23.2）"
+              echo "::error::  Gitee  : https://gitee.com/OpenFlun/nodejs-mobile/releases   （国内镜像）"
+              exit 1
+            fi
+          fi
+          # 语义校验：URL 里的 tag 不能是 v18。手动填错、或仓库变量残留时在这里拦住，
+          # 不必等到闸门才报错，日志也更贴近根因。
+          case "$URL" in
+            *"/18.20.4/"*|*"/v18."*|*nodejs-mobile-v18*)
+              echo "::error::运行时 URL 指向 v18：$URL"
+              echo "::error::上游 engines.node = ^22.19.0 || >=24.0.0，v18 的 cli.mjs 会抛 (reading 'bind') 后不监听 18900。"
+              echo "::error::请清空仓库变量 NODE_MOBILE_URL / 输入 libnode_url，或改填 v22.23.2 的 android-libnode.zip。"
+              exit 1 ;;
+          esac
+          echo "下载：$URL"
+          chmod +x "$PROJECT_DIR/scripts/fetch-libnode.sh"
+          bash "$PROJECT_DIR/scripts/fetch-libnode.sh" "$URL" "$LIBNODE_SHA256"
+
+      # -------------------------------------------------------------- 7b
+      # ★ 关键：libnode.so 是 C++ 库，DT_NEEDED 里有 libc++_shared.so。
+      # 本工程胶水是纯 C，AGP 不会自动打包这份 STL。缺失时真机 dlopen 报：
+      #   library "libc++_shared.so" not found ... in namespace classloader-namespace
+      # 独立成步（不依赖上一步是否下载成功），从已安装的 NDK 复制同架构 STL。
+      - name: 补齐 libc++_shared.so（libnode.so 的 C++ 运行时依赖）
+        shell: bash
+        run: |
+          set -euo pipefail
+          JNI="$PROJECT_DIR/app/src/main/jniLibs/arm64-v8a"
+          mkdir -p "$JNI"
+          if [ -f "$JNI/libc++_shared.so" ]; then
+            echo "已随工程包提供，跳过：$(du -h "$JNI/libc++_shared.so" | cut -f1)"
+            exit 0
+          fi
+
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          NDK_VER="27.0.12077973"
+          NDK="$SDK_ROOT/ndk/$NDK_VER"
+          SRC=""
+          for c in \
+            "$NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" \
+            "$NDK/sources/cxx-stl/llvm-libc++/libs/arm64-v8a/libc++_shared.so"; do
+            [ -f "$c" ] && { SRC="$c"; break; }
+          done
+          if [ -z "$SRC" ]; then
+            SRC="$(find "$NDK" -type f -name 'libc++_shared.so' \
+              \( -path '*aarch64-linux-android*' -o -path '*arm64-v8a*' \) 2>/dev/null \
+              | grep -vE '/[0-9]{2}/libc\+\+_shared\.so$' | head -n1 || true)"
+          fi
+          if [ -z "$SRC" ] && [ -d "$SDK_ROOT/ndk" ]; then
+            # 最后一档不过滤 API 子目录：能找到一份就能用
+            SRC="$(find "$SDK_ROOT/ndk" -type f -name 'libc++_shared.so' \
+              \( -path '*aarch64-linux-android*' -o -path '*arm64-v8a*' \) 2>/dev/null \
+              | head -n1 || true)"
+          fi
+          if [ -z "$SRC" ] || [ ! -f "$SRC" ]; then
+            echo "::error::NDK 中找不到 arm64 的 libc++_shared.so（NDK=$NDK）。"
+            echo "::error::请把该文件放进完整工程的 app/src/main/jniLibs/arm64-v8a/ 后重新上传。"
+            exit 1
+          fi
+          cp "$SRC" "$JNI/libc++_shared.so"
+          echo "来源：$SRC"
+          echo "  → $JNI/libc++_shared.so ($(du -h "$JNI/libc++_shared.so" | cut -f1))"
+          echo "✅ 已随 APK 打包，dlopen(libnode.so) 不会再缺 STL"
+
+      # -------------------------------------------------------------- 8
+      - name: 配置 Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          # 工程不带 gradle wrapper；此输入会在 runner 上 provision 指定版本并加入 PATH
+          gradle-version: ${{ env.GRADLE_VERSION }}
+
+      - name: 构建前自检（散放源码 / libnode / STL / 胶水）
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "PROJECT_DIR = $PROJECT_DIR"
+          SRC="$PROJECT_DIR/app/src/main/assets/node"
+          SO="$PROJECT_DIR/app/src/main/jniLibs/arm64-v8a/libnode.so"
+          STL="$PROJECT_DIR/app/src/main/jniLibs/arm64-v8a/libc++_shared.so"
+          GLUE="$PROJECT_DIR/app/src/main/cpp/dsh-node.c"
+          CMAKE="$PROJECT_DIR/app/src/main/cpp/CMakeLists.txt"
+          ICU="$SRC/icudtl.dat"
+          echo "==> oc-proot-gateway-r5d 网关源码（散放）"
+          echo "  bootstrap.cjs     : $([ -f "$SRC/bootstrap.cjs" ] && echo 已就位 || echo '缺失 ❌')"
+          echo "  oc-proxy.cjs      : $([ -f "$SRC/oc-proxy.cjs" ] && echo 已就位 || echo '缺失 ❌')"
+          echo "  rootfs-manager.cjs: $([ -f "$SRC/rootfs-manager.cjs" ] && echo 已就位 || echo '缺失 ❌')"
+          echo "  package.json      : $([ -f "$SRC/package.json" ] && echo 已就位 || echo '缺失 ❌')"
+          echo "  cli.mjs(占位)     : $([ -f "$SRC/packages/standalone/cli.mjs" ] && echo 已就位 || echo '缺失 ❌')"
+          echo "  bundle-version.txt: $([ -f "$SRC/bundle-version.txt" ] && cat "$SRC/bundle-version.txt" || echo '缺失 ❌')"
+          echo "  文件数 / 体积     : $(find "$SRC" -type f 2>/dev/null | wc -l | tr -d ' ') 个 / $(du -sh "$SRC" 2>/dev/null | cut -f1)"
+          echo "  node_modules      : $([ -d "$SRC/node_modules" ] && echo '存在 ❌' || echo '无 ✅')"
+          echo "  符号链接          : $(find "$SRC" -type l 2>/dev/null | wc -l | tr -d ' ') 个"
+          SRCMB="$(du -sm "$SRC" 2>/dev/null | cut -f1)"
+          if [ "${SRCMB:-0}" -gt 20 ]; then
+            echo "::error::assets/node ${SRCMB} MB，远超正常的 ~10 MB，疑似混入 node_modules / 旧 bundle.zip / 重复 icudtl.dat"
+            find "$SRC" -type f -printf '%s %p\n' | sort -rn | head -15
+            exit 1
+          fi
+          echo "==> 运行时"
+          echo "  libnode.so        : $([ -f "$SO" ]  && du -h "$SO"  | cut -f1 || echo '缺失 ❌')"
+          echo "  libc++_shared.so  : $([ -f "$STL" ] && du -h "$STL" | cut -f1 || echo '缺失 ❌')"
+          echo "  JNI 胶水 / CMake  : $([ -f "$GLUE" ] && echo 已就位 || echo '缺失 ❌') / $([ -f "$CMAKE" ] && echo 已就位 || echo '缺失 ❌')"
+          echo "  icudtl.dat        : $([ -f "$ICU" ] && du -h "$ICU" | cut -f1 || echo '无（v22 内嵌 full-icu，r8 默认跳过 ✅）')"
+          if [ -f "$SO" ]; then
+            python3 -c "import sys,hashlib;d=open(sys.argv[1],'rb').read();h=d[:20];m=h[18]|(h[19]<<8);print('  libnode 核对      : %.1f MB | sha256=%s... | e_machine=%d (183=AArch64)'%(len(d)/1048576.0,hashlib.sha256(d).hexdigest()[:16],m))" "$SO"
+          fi
+          [ -f "$PROJECT_DIR/settings.gradle.kts" ] || { echo "::error::缺 settings.gradle.kts"; exit 1; }
+          [ -f "$PROJECT_DIR/app/build.gradle.kts" ] || { echo "::error::缺 app/build.gradle.kts"; exit 1; }
+          [ -f "$GLUE" ]  || { echo "::error::缺 app/src/main/cpp/dsh-node.c，请上传最新完整工程包"; exit 1; }
+          [ -f "$CMAKE" ] || { echo "::error::缺 app/src/main/cpp/CMakeLists.txt"; exit 1; }
+          if [ ! -f "$SRC/oc-proxy.cjs" ] || [ ! -f "$SRC/rootfs-manager.cjs" ] || [ ! -f "$SRC/bootstrap.cjs" ] || [ ! -f "$SRC/package.json" ] || [ ! -f "$SRC/packages/standalone/cli.mjs" ]; then
+            echo "::warning::网关源码不完整：APK 能编译，但装上后 AssetInstaller 会报「源码不完整」。看步骤 6 日志（SKIP_BUNDLE 或脚本失败）。"
+          fi
+          if [ ! -f "$SO" ]; then
+            echo "::warning::缺 libnode.so：APK 能编译，但装上后 Node 引擎起不来。请在 Run workflow 填 libnode_url。"
+          fi
+          if [ ! -f "$STL" ]; then
+            echo "::warning::缺 libc++_shared.so：dlopen(libnode.so) 会报 library not found（步骤 7b 应已自动补齐）。"
+          fi
+          if [ -f "$SO" ]; then
+            echo "CMake 形态：✅ 官方 DT_NEEDED（libdsh-node.so 链接 libnode.so，linker 绑定符号）"
+          else
+            echo "CMake 形态：⚠️ 回退 dlopen+dlsym（未找到 libnode.so，V8 初始化可能静默失败）"
+          fi
+
+      # -------------------------------------------------------------- 8b
+      # ★ 硬闸门：只要 libnode.so 是 v18，就让构建直接失败，不再产出「能装但跑不起来」的 APK。
+      # 前两轮截图都是 47.2 MB / node=v18.20.4，却照样打出了可安装的包 —— 因为
+      # 版本校验写在 fetch-libnode.sh 内部，而下载步骤带 continue-on-error：
+      # 一旦下载失败 / 被 NODE_MOBILE_URL 覆盖成 v18 / 工程包自带旧 .so，
+      # 脚本根本没跑，旧 v18 就静默混进 APK。闸门必须独立于下载、无条件执行。
+      - name: 运行时版本闸门（Node 必须 >= 22，否则构建失败）
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::notice::workflow 版本：2026-11-06-r11（Node 22 + JNI / 散放源码 / strip / 体积清单）。CI 日志里搜不到这行，说明仓库根的明文 build.yml 没覆盖提交。"
+          SO="$PROJECT_DIR/app/src/main/jniLibs/arm64-v8a/libnode.so"
+          if [ ! -f "$SO" ]; then
+            # 步骤 7 带 continue-on-error：探测/下载失败会被吞成黄色。
+            # 闸门必须在这里兜住，否则会产出一个「能装、能打开、但没有 Node 引擎」的废 APK。
+            echo "::error::libnode.so 不存在 —— 运行时探测或下载失败了（见步骤「放置 nodejs-mobile 的 libnode.so」日志）。"
+            echo "::error::本工程目标是可运行的网关，不再放行「仅编译壳」的产物。"
+            echo "::error::请在 Run workflow 填 libnode_url（v22.23.2 的 android-libnode.zip 直链）后重跑。"
+            exit 1
+          fi
+          python3 - "$SO" <<'PY'
+          import sys, re
+          d = open(sys.argv[1], "rb").read()
+          mb = len(d) / 1048576.0
+          vers = sorted({m.group(0).decode() for m in re.finditer(rb"v(\d{2})\.(\d+)\.(\d+)", d)},
+                        key=lambda s: tuple(int(x) for x in s[1:].split(".")), reverse=True)
+          print("闸门核对       : %.1f MB | 内嵌版本候选 = %s" % (mb, ", ".join(vers[:4]) or "无"))
+          # ★ r4：以内嵌版本字符串为主判据，体积只作辅助。
+          # r3 用「<60MB 判 v18」在本轮日志里险些出事：OpenFlun v18 基线的
+          # arm64 .so 是 59.6 MB，离 60 只差 0.4 MB；若 v22 某批次压缩到
+          # 59 MB 就会被误杀。版本字符串里最大的 vNN.x.y 才是 Node 自己的版本
+          # （V8 版本不带 v 前缀也不会是 vNN.x.y 形态），最稳。
+          major = int(vers[0][1:].split(".")[0]) if vers else 0
+          bad = (major < 22) if vers else (mb < 60)
+          if bad:
+              print("::error::打进 APK 的 libnode.so 是 %s / %.1f MB，属于 Node 18，不满足上游 engines.node。" % (vers[0] if vers else "未识别", mb))
+              print("::error::上游 engines.node = ^22.19.0 || >=24.0.0；cli.mjs 在 v18 会抛 (reading 'bind') 后不监听 18900。")
+              print("::error::按 CI 日志定位（看「默认探测命中」那一行）：")
+              print("::error::  ① 命中 .../v18.20.4/android-libnode.zip → 明文 build.yml 还是 r3 旧版，未覆盖提交（GitHub 只认明文）")
+              print("::error::  ② 命中 .../v22.x/ 但 .so 仍是 v18 → release 资产名与内容不符，或下载被缓存/代理替换")
+              print("::error::  ③ 仓库变量 NODE_MOBILE_URL / 输入 libnode_url 指向 v18 直链（优先级高于默认探测）")
+              print("::error::  ④ 下载步骤失败但 continue-on-error 放行，工程包里自带的旧 v18 .so 被直接打包")
+              print("::error::请改用 v22.23.2 的 android-libnode.zip（OpenFlun/nodejs-mobile Releases），或清空变量后重跑。")
+              sys.exit(1)
+          print("✅ 闸门通过：%s / %.1f MB，判定为 Node 22+ 运行时" % (vers[0] if vers else "体积兜底", mb))
+          PY
+          echo "生效的 libnode URL：${LIBNODE_URL:-（留空，走默认探测）}"
+
+      # -------------------------------------------------------------- 9
+      - name: 编译 APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          [ -n "$SDK" ] || { echo "::error::ANDROID_HOME 未设置"; exit 1; }
+          echo "sdk.dir=$SDK" > local.properties
+
+          # 二次加固：解压步骤已归一化过一次，这里再把「参与 CMake 配置的
+          # 源码与脚本」压到过去时间，排除 build/.cxx/.ofm-src 等生成目录。
+          # 即便用户换了打包工具、或中间步骤又带进未来时间戳，也兜得住。
+          find . -type f \
+            -not -path './build/*' -not -path './.cxx/*' -not -path './.gradle/*' \
+            -not -path './.ofm-src/*' -not -path './app/build/*' \
+            -not -path './app/.cxx/*' \
+            -exec touch -d '2000-01-01 00:00:00 UTC' {} +
+          echo "编译前时间戳已复核：源码均为 2000-01-01 UTC，产物将严格更新"
+
+          GRADLE_BIN="$(command -v gradle || true)"
+          if [ -z "$GRADLE_BIN" ]; then
+            GRADLE_BIN="$(find "$HOME/.gradle" /opt/hostedtoolcache /usr/local -maxdepth 6 \
+              -type f -path '*/bin/gradle' -perm -u+x 2>/dev/null | sort -V | tail -n1 || true)"
+          fi
+          if [ -z "$GRADLE_BIN" ] || [ ! -x "$GRADLE_BIN" ]; then
+            echo "::error::找不到可执行的 gradle（setup-gradle 的 gradle-version 未生效）"
+            exit 1
+          fi
+          echo "GRADLE_BIN = $GRADLE_BIN"
+          "$GRADLE_BIN" --version
+
+          case "$BUILD_TYPE" in
+            debug)   "$GRADLE_BIN" --no-daemon --stacktrace assembleDebug ;;
+            release) "$GRADLE_BIN" --no-daemon --stacktrace assembleRelease ;;
+            both)    "$GRADLE_BIN" --no-daemon --stacktrace assembleDebug assembleRelease ;;
+            *)       echo "::error::未知 BUILD_TYPE=$BUILD_TYPE"; exit 1 ;;
+          esac
+
+      # -------------------------------------------------------------- 10
+      - name: 收集 APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          WS="${GITHUB_WORKSPACE}"
+          SHA="$(git -C "$WS" rev-parse --short=7 HEAD)"
+          mkdir -p "$WS/artifacts"
+          find "$PROJECT_DIR/app/build/outputs/apk" -type f -name '*.apk' -print0 \
+            | while IFS= read -r -d '' f; do
+                variant="$(basename "$(dirname "$f")")"
+                out="$WS/artifacts/AggregateGateway-${variant}-${SHA}.apk"
+                cp "$f" "$out"
+                echo "产出：$out ($(du -h "$out" | cut -f1))"
+              done
+          test -n "$(ls -A "$WS/artifacts" 2>/dev/null)" || {
+            echo "::error::Gradle 未产出任何 APK"; exit 1;
+          }
+
+      # -------------------------------------------------------------- 10b
+      # r7/r8：体积构成自动打印（无需 adb、无需解压 APK），并标出 r8 的
+      # STORED 大 .so —— AGP 若未压缩 libnode.so，APK 会虚胖几十 MB。
+      - name: APK 体积构成（自动打印，无需手动操作）
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="$(ls -1 "${GITHUB_WORKSPACE}"/artifacts/*.apk 2>/dev/null | head -n1 || true)"
+          if [ -z "$APK" ] || [ ! -f "$APK" ]; then
+            echo "没有 APK 可分析（构建失败）"; exit 0
+          fi
+          python3 - "$APK" <<'PY'
+          import sys, os, zipfile, collections
+          p = sys.argv[1]
+          z = zipfile.ZipFile(p)
+          cat = collections.Counter(); catn = collections.Counter(); items = []
+          for i in z.infolist():
+              n = i.filename
+              if   n.startswith('assets/node/'):    k = '上游源码 assets/node/（散放）'
+              elif n.startswith('assets/'):         k = '其它 assets/'
+              elif n == 'lib/arm64-v8a/libnode.so': k = 'libnode.so（运行时）'
+              elif n.endswith('libdsh-node.so'):    k = '自建 JNI 胶水 libdsh-node.so'
+              elif n.startswith('lib/'):            k = '其它原生库 lib/（STL 等）'
+              elif n.endswith('.dex'):              k = 'classes.dex'
+              else:                                 k = '资源/签名'
+              cat[k] += i.compress_size; catn[k] += 1
+              items.append((i.compress_size, i.file_size, i.compress_type, n))
+          tot = os.path.getsize(p)
+          L = ['## APK 体积构成（自动分析 / r11）', '',
+               '`%s` — **%.2f MB**，共 %d 个条目' % (os.path.basename(p), tot/1048576, len(z.infolist())),
+               '', '| 类别 | 压缩后 | 条目数 |', '|---|---:|---:|']
+          for k, v in cat.most_common():
+              L.append('| %s | %.2f MB | %d |' % (k, v/1048576, catn[k]))
+          L += ['', '### 最大的 12 个条目', '',
+                '| 压缩后 | 原始 | 方式 | 文件 |', '|---:|---:|---|---|']
+          for c, u, t, n in sorted(items, reverse=True)[:12]:
+              L.append('| %.2f MB | %.2f MB | %s | `%s` |' % (
+                  c/1048576, u/1048576, 'DEFLATE' if t == 8 else 'STORED', n))
+          txt = '\n'.join(L)
+          print(txt)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as f:
+              f.write('\n' + txt + '\n')
+          src = cat.get('上游源码 assets/node/（散放）', 0)
+          if src > 20 * 1048576:
+              print('::warning::上游源码区 %.1f MB，远超正常的 ~8 MB；对照上表找大文件。' % (src/1048576))
+          else:
+              print('✅ 上游源码区 %.1f MB，正常（零 node_modules / 无 bundle.zip）。' % (src/1048576))
+          big_stored = [(c,u,n) for c,u,t,n in items
+                        if t != 8 and u > 10*1048576 and (n.startswith('lib/') or n.startswith('assets/'))]
+          if big_stored:
+              for c,u,n in big_stored[:5]:
+                  print('::warning::大文件为 STORED（未压缩）：%s %.1f MB → 检查 useLegacyPackaging / noCompress' % (n, u/1048576))
+          else:
+              print('✅ 无 STORED 的大 .so / 大 assets 条目')
+          PY
+
+      # -------------------------------------------------------------- 11
+      - name: 上传 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: AggregateGateway-APK-${{ github.run_number }}
+          path: artifacts/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      # -------------------------------------------------------------- 12
+      - name: 构建结果汇总
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          WS="${GITHUB_WORKSPACE}"
+          PD="${PROJECT_DIR:-$WS/_unpacked}"
+          SRC="$PD/app/src/main/assets/node"
+          SO="$PD/app/src/main/jniLibs/arm64-v8a/libnode.so"
+          STL="$PD/app/src/main/jniLibs/arm64-v8a/libc++_shared.so"
+          GLUE="$PD/app/src/main/cpp/dsh-node.c"
+          mark() { [ "$1" = "1" ] && echo "✅" || echo "⚠️ 缺失"; }
+          b=0; s=0; t=0; g=0
+          [ -f "$SRC/package.json" ] && [ -f "$SRC/packages/standalone/cli.mjs" ] && b=1
+          [ -f "$SO" ]     && s=1
+          [ -f "$STL" ]    && t=1
+          [ -f "$GLUE" ]   && g=1
+          {
+            echo "## 限量网关 APK 构建结果（r11 / Node 22 + JNI + 散放源码）"
+            echo ""
+            echo "| 检查项 | 状态 |"
+            echo "|---|---|"
+            echo "| 压缩包 | ${ZIP_USED:-未找到} |"
+            echo "| 工程目录 | ${PD} |"
+            echo "| 构建类型 | ${BUILD_TYPE} |"
+            echo "| 上游源码（散放 assets/node） | $(mark $b) · $(find "$SRC" -type f 2>/dev/null | wc -l | tr -d ' ') 个 / $(du -sh "$SRC" 2>/dev/null | cut -f1) |"
+            echo "| libnode.so (arm64) | $(mark $s) |"
+            echo "| libc++_shared.so (arm64) | $(mark $t) |"
+            echo "| 自建 JNI 胶水（CMake 编译） | $(mark $g) |"
+            echo ""
+            echo "### 产物"
+            if [ -d "$WS/artifacts" ] && [ -n "$(ls -A "$WS/artifacts" 2>/dev/null)" ]; then
+              for f in "$WS"/artifacts/*.apk; do
+                echo "- \`$(basename "$f")\` — $(du -h "$f" | cut -f1)"
+              done
+            else
+              echo "- 无（构建失败）"
+            fi
+            echo ""
+            if [ "$b" = 1 ] && [ "$s" = 1 ] && [ "$t" = 1 ] && [ "$g" = 1 ]; then
+              echo "> 运行时依赖齐备，可安装验证。界面「运行时自检」会显示源码（散放）、libnode.so、JNI 胶水与已释放目录四项。"
+            else
+              echo "> ⚠️ **这是壳 APK**：能编译、能安装，但网关启动会失败。"
+              echo "> 补齐方式：在 Run workflow 里指定 \`libnode_url\` 拿到 arm64 的 \`libnode.so\`；"
+              echo "> \`libc++_shared.so\` 由 workflow 从 NDK 自动补齐（也可手动放进 jniLibs）；"
+              echo "> 并确保完整包内含 \`app/src/main/cpp/\`（自建胶水，无需任何 aar）；源码由步骤 6 散放生成，libnode.so 已按 r8 strip。"
+            fi
+            echo ""
+            echo "> release 产物为 **unsigned**；默认 debug 已由 AGP 用 debug keystore 签名，可直接安装。"
+          } >> "$GITHUB_STEP_SUMMARY"
