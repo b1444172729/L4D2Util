@@ -1,0 +1,336 @@
+# =============================================================================
+# 从「仓库里一个 zip 压缩包」解压源码 → 编译 APK → 生成 rootfs 的一体化 workflow
+#
+# ⚠⚠ 这个文件必须作为【明文文件】单独放到仓库根的 .github/workflows/build.yml
+#    「一起塞进 opencode_rootfs.zip」是无效的：GitHub 只认提交里的明文 yml，
+#    zip 是二进制，里面的 .github 不会被当成 workflow，Actions 页会空白。
+#
+# 你的仓库最终只需要 2 个东西：
+#    opencode_rootfs.zip                 ← 你压缩/重命名后的源码包（里面可以套任意层文件夹）
+#    .github/workflows/build.yml          ← 本文件（明文）
+#
+# 本 workflow 会自动：
+#    1. 找到 zip（精确名优先，找不到就取仓库里第一个 .zip）
+#    2. 解压，剔除 __MACOSX / ._*，【递归定位含 settings.gradle 的目录】，
+#       所以「里面还套了一层文件夹」甚至两层都能正确拍平
+#    3. 校验关键文件；release.keystore 漏了就自动生成
+#    4. 用 Gradle 8.8 + JDK 17 + Android SDK 34 编译 arm64-v8a release APK
+#    5. 在免费的 arm64 runner 上跑 rootfs/build-rootfs.sh 生成 rootfs-arm64.tar.gz
+#    6. 把 APK 与 rootfs 一起发到 Release（tag = build-<run_number>），
+#       同时在 Actions artifacts 里各留一份
+# =============================================================================
+name: build-from-zip
+
+on:
+  workflow_dispatch:
+    inputs:
+      oc_ver:
+        description: 'OpenCode v2 版本（留空 = 自动取 npm latest；免费模型必须 v2，别填 1.x）'
+        required: false
+        default: ''
+      skip_apt:
+        description: '跳过 chroot 安装 git（推荐 true；网关不调 /api/vcs/init）'
+        type: boolean
+        required: false
+        default: true
+      build_rootfs:
+        description: '同时也生成 rootfs-arm64.tar.gz（约 100~150 MB，需要几分钟）'
+        type: boolean
+        required: false
+        default: true
+  push:
+    paths:
+      - 'opencode_rootfs.zip'
+      - '.github/workflows/build.yml'
+      - '**/*.zip'
+
+permissions:
+  contents: write
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1) 解压并拍平：只做一次，产物作为 artifact 交给后面两个 job
+  # ---------------------------------------------------------------------------
+  unpack:
+    runs-on: ubuntu-latest
+    outputs:
+      found: ${{ steps.locate.outputs.found }}
+      src_dir: ${{ steps.locate.outputs.src_dir }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 定位 / 解压 / 拍平嵌套目录
+        id: locate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # ① 精确名优先；找不到就取仓库里第一个 .zip（兼容你随手起的名字）
+          ZIP=""
+          for n in opencode_rootfs.zip OPENCODE_ROOTFS.zip opencode_rootfs.ZIP; do
+            if [ -f "$n" ]; then ZIP="$n"; break; fi
+          done
+          if [ -z "$ZIP" ]; then
+            ZIP=$(find "$GITHUB_WORKSPACE" -maxdepth 3 -type f -iname '*.zip' ! -iname 'source.tgz' | sort | sed -n '1p' || true)
+          fi
+          if [ -z "$ZIP" ] || [ ! -s "$ZIP" ]; then
+            echo "::warning::仓库里没有 opencode_rootfs.zip，也没有其它 .zip。本次跳过（不算失败）。"
+            echo "::warning::请用 Add file → Upload files 把压缩包传到仓库根目录。"
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "📦 找到压缩包：$ZIP ($(du -h "$ZIP" | cut -f1))"
+
+          # ② 解压到独立临时目录，避免污染工作区 / 覆盖根 workflow
+          rm -rf /tmp/unz && mkdir -p /tmp/unz
+          unzip -q -o "$ZIP" -d /tmp/unz || { echo "::error::unzip 失败，文件可能不是有效 zip"; exit 1; }
+
+          # ③ 清掉 macOS 压缩带进来的垃圾
+          find /tmp/unz -type d -name '__MACOSX' -prune -exec rm -rf {} + 2>/dev/null || true
+          find /tmp/unz -type f -name '._*' -delete 2>/dev/null || true
+
+          # ④ 【核心】递归找含 settings.gradle 的目录 —— 不管 zip 里套 1 层还是 2 层文件夹
+          SRC=""
+          while IFS= read -r d; do
+            if [ -f "$d/app/build.gradle" ] || [ -f "$d/app/build.gradle.kts" ]; then
+              SRC="$d"; break
+            fi
+          done < <(find /tmp/unz -type f \( -name 'settings.gradle' -o -name 'settings.gradle.kts' \) -printf '%h\n' | sort -u)
+
+          if [ -z "$SRC" ]; then
+            echo "::error::解压后找不到带 app/build.gradle 的 settings.gradle 目录。实际结构："
+            find /tmp/unz -maxdepth 4 | sed -n "1,80p"
+            echo "::error::请确认压缩包里确实包含 app/、settings.gradle、rootfs/ 这几个条目。"
+            exit 1
+          fi
+          echo "📂 源码根目录：$SRC"
+          echo "   （相对解压根：${SRC#/tmp/unz/}）"
+
+          # ⑤ 关键文件校验（keystore 单独兜底，见 apk job）
+          for f in settings.gradle gradle.properties app/build.gradle \
+                   app/src/main/AndroidManifest.xml \
+                   app/src/main/java/com/ocgw/app/GatewayService.kt \
+                   rootfs/build-rootfs.sh; do
+            if [ ! -f "$SRC/$f" ]; then
+              echo "::error::缺少 $f —— 压缩包不完整，请重新压缩时把隐藏目录 .github/ 和所有文件都带上"
+              exit 1
+            fi
+          done
+          echo "✅ 关键文件齐全"
+
+          # ⑥ 拍平到统一路径，打包成 artifact
+          rm -rf "$GITHUB_WORKSPACE/src"
+          mkdir -p "$GITHUB_WORKSPACE/src"
+          cp -a "$SRC/." "$GITHUB_WORKSPACE/src/"
+          tar -czf "$GITHUB_WORKSPACE/source.tgz" -C "$GITHUB_WORKSPACE/src" .
+          echo "📤 源码快照：$(du -h "$GITHUB_WORKSPACE/source.tgz" | cut -f1)"
+
+          echo "found=true" >> "$GITHUB_OUTPUT"
+          echo "src_dir=src" >> "$GITHUB_OUTPUT"
+
+      - name: 上传源码快照
+        if: steps.locate.outputs.found == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: source
+          path: source.tgz
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # 2) 编译 APK
+  # ---------------------------------------------------------------------------
+  apk:
+    needs: unpack
+    if: ${{ needs.unpack.outputs.found == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: 下载源码快照
+        uses: actions/download-artifact@v4
+        with:
+          name: source
+          path: .
+
+      - name: 解开源码
+        run: |
+          mkdir -p src
+          tar -xzf source.tgz -C src
+          ls -la src | sed -n "1,20p"
+
+      - name: JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # settings.gradle 里钉的是 AGP 8.5.2 / Kotlin 2.0.20；
+      # AGP 8.5 要求 Gradle >= 8.7，Kotlin 2.0.20 上限约 8.8，故锁 8.8。
+      - name: Gradle 8.8
+        uses: gradle/actions/setup-gradle@v4
+        continue-on-error: true
+        with:
+          gradle-version: '8.8'
+          cache-read-only: false
+
+      - name: 配置 Android SDK 34
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          SM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          if [ -x "$SM" ]; then
+            yes | "$SM" --licenses >/dev/null 2>&1 || true
+            "$SM" "platforms;android-34" "build-tools;34.0.0" >/dev/null 2>&1 || true
+          fi
+          echo "已装 platforms:"; ls "$SDK/platforms" 2>/dev/null || true
+
+      - name: 兜底生成签名 keystore（压缩包漏带时）
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f src/release.keystore ]; then
+            echo "✅ 使用压缩包内的 release.keystore"
+          elif [ -n "${{ secrets.KEYSTORE_B64 }}" ]; then
+            echo "${{ secrets.KEYSTORE_B64 }}" | base64 -d > src/release.keystore
+            echo "✅ 使用 secrets.KEYSTORE_B64"
+          else
+            echo "⚠ 压缩包里没有 release.keystore，现场生成一枚（仅自用）"
+            keytool -genkeypair -v -keystore src/release.keystore -keyalg RSA -keysize 2048 \
+              -validity 10000 -alias ocgw -dname "CN=OCGW" \
+              -storepass android -keypass android
+          fi
+
+      - name: 编译 arm64-v8a release APK
+        working-directory: src
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v gradle >/dev/null || { echo "::error::runner 上找不到 gradle"; exit 1; }
+          gradle --version | sed -n '1,12p'
+          gradle assembleRelease --no-daemon --stacktrace \
+            -Pandroid.injected.signing.store.file="${{ github.workspace }}/src/release.keystore" \
+            -Pandroid.injected.signing.store.password=android \
+            -Pandroid.injected.signing.key.alias=ocgw \
+            -Pandroid.injected.signing.key.password=android
+
+      - name: 收集 APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          find src/app/build/outputs -type f -name '*.apk' -exec cp -v {} out/ \;
+          test -n "$(ls -A out)" || { echo "::error::没产出任何 APK"; exit 1; }
+          ls -lh out
+
+      - name: 上传 APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-arm64
+          path: out/*.apk
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # 3) 生成 rootfs-arm64.tar.gz（原文件已下架，必须自己重建）
+  # ---------------------------------------------------------------------------
+  rootfs:
+    needs: unpack
+    if: ${{ needs.unpack.outputs.found == 'true' && (github.event_name != 'workflow_dispatch' || inputs.build_rootfs) }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    steps:
+      - name: 下载源码快照
+        uses: actions/download-artifact@v4
+        with:
+          name: source
+          path: .
+
+      - name: 解开源码
+        run: |
+          mkdir -p src
+          tar -xzf source.tgz -C src
+
+      - name: 生成 rootfs-arm64.tar.gz
+        shell: bash
+        env:
+          OC_VER: ${{ inputs.oc_ver }}
+        run: |
+          set -euo pipefail
+          cd src
+          SKIP="${{ inputs.skip_apt }}"
+          # push 触发时 inputs 为空 → 默认走轻量版（不需要 chroot / mount）
+          if [ -z "$SKIP" ] || [ "$SKIP" = "true" ]; then
+            echo "▶ --skip-apt（网关不调 /api/vcs/init，不需要 git）"
+            sudo -E env OC_VER="$OC_VER" bash rootfs/build-rootfs.sh --skip-apt
+          else
+            echo "▶ 完整版（含 git）"
+            sudo -E env OC_VER="$OC_VER" bash rootfs/build-rootfs.sh
+          fi
+          ls -lh rootfs-arm64.tar.gz rootfs-arm64.tar.gz.sha256
+          cat rootfs-arm64.tar.gz.sha256
+
+      - name: 归档自检
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd src
+          tar -tzf rootfs-arm64.tar.gz > /tmp/entries.txt
+          for f in ./opencode/bin/opencode ./proot/bin/proot ./proot/libexec/loader ./proot/lib/libtalloc.so.2; do
+            grep -qF "$f" /tmp/entries.txt || { echo "❌ 归档缺少 $f"; exit 1; }
+          done
+          echo "✅ 四件套齐全，归档条目 $(wc -l < /tmp/entries.txt) 个"
+
+      - name: 上传 rootfs artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rootfs-arm64
+          path: |
+            src/rootfs-arm64.tar.gz
+            src/rootfs-arm64.tar.gz.sha256
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # 4) 汇总成一个 Release（artifact 始终可用，Release 失败不影响编译结果）
+  # ---------------------------------------------------------------------------
+  publish:
+    needs: [unpack, apk, rootfs]
+    if: ${{ always() && needs.unpack.outputs.found == 'true' && needs.apk.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: 下载 APK
+        uses: actions/download-artifact@v4
+        with:
+          name: apk-arm64
+          path: dist
+
+      - name: 下载 rootfs（失败也不影响 APK）
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: rootfs-arm64
+          path: dist
+
+      - name: 列出产物
+        run: find dist -type f -printf '%f  %k KB\n' | sort
+
+      - name: 发布 Release
+        uses: softprops/action-gh-release@v2
+        continue-on-error: true
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: 'OpenCode Gateway build #${{ github.run_number }}'
+          body: |
+            由 `opencode_rootfs.zip` 自动解压构建。
+            - Commit: ${{ github.sha }}
+            - 源码包内嵌目录已自动拍平
+            - **app-arm64-v8a-release.apk**：装机用
+            - **rootfs-arm64.tar.gz**：`adb push` 到 `/sdcard/Download/`，APP 启动时会优先读本地归档
+            - 网关：`http://127.0.0.1:4318/v1`；Web UI：`http://127.0.0.1:4317`
+            - 生成 rootfs 的脚本在源码包 `rootfs/build-rootfs.sh`，说明见 `OFFLINE_BUILD.md`
+          files: |
+            dist/*.apk
+            dist/rootfs-arm64.tar.gz
+            dist/rootfs-arm64.tar.gz.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
