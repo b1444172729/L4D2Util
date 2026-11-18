@@ -1,0 +1,255 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ghub-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  JAVA_VERSION: "17"
+  GRADLE_VERSION: "8.13"
+  COMPILE_SDK: "35"
+  BUILD_TOOLS: "35.0.0"
+
+jobs:
+  build:
+    name: Build APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    outputs:
+      signed: ${{ steps.signing.outputs.enabled }}
+      project_dir: ${{ steps.project.outputs.dir }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Set up Gradle ${{ env.GRADLE_VERSION }}
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
+
+      - name: Install Android SDK components (if missing)
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDKMGR="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          [ -d "$ANDROID_HOME/platforms/android-${COMPILE_SDK}" ] || "$SDKMGR" --install "platforms;android-${COMPILE_SDK}"
+          [ -d "$ANDROID_HOME/build-tools/${BUILD_TOOLS}" ] || "$SDKMGR" --install "build-tools;${BUILD_TOOLS}"
+
+      # 仓库根只有 GitHubManager-main.zip（内部还套了一层 GitHubManager/ 文件夹），
+      # 这里把所有 zip 解压到 _src，再交给下一步递归查找。
+      - name: Unpack source archive
+        id: unpack
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob nocaseglob
+          zips=( *.zip )
+          if [ "${#zips[@]}" -eq 0 ]; then
+            echo "mode=repo" >> "$GITHUB_OUTPUT"
+            echo "仓库根未发现 zip，按普通源码仓库处理"
+            exit 0
+          fi
+          echo "发现压缩包：${zips[*]}"
+          rm -rf _src
+          mkdir -p _src
+          for z in "${zips[@]}"; do
+            echo "解压 $z ..."
+            unzip -q -o "$z" -d _src || { echo "::error::解压失败：$z"; exit 1; }
+          done
+          echo "mode=zip" >> "$GITHUB_OUTPUT"
+          echo "----- _src 顶层内容 -----"
+          ls -la _src
+          echo "----- 目录树（前 20 行）-----"
+          find _src -maxdepth 2 -type d | head -n 20
+
+      # 递归查找含 app/build.gradle(.kts) 的目录，兼容任意层级嵌套
+      - name: Locate project root
+        id: project
+        shell: bash
+        run: |
+          set -euo pipefail
+          bases=()
+          if [ "${{ steps.unpack.outputs.mode }}" = "zip" ]; then bases+=("_src"); fi
+          bases+=(".")
+          for base in "${bases[@]}"; do
+            [ -d "$base" ] || continue
+            while IFS= read -r hit; do
+              dir="$(dirname "$hit")"
+              if [ -f "$dir/app/build.gradle.kts" ] || [ -f "$dir/app/build.gradle" ]; then
+                echo "dir=$dir" >> "$GITHUB_OUTPUT"
+                echo "已定位项目根目录：$dir"
+                echo "----- 该目录内容 -----"
+                ls "$dir"
+                exit 0
+              fi
+            done < <(find "$base" -maxdepth 6 \( -name 'settings.gradle.kts' -o -name 'settings.gradle' \) -print 2>/dev/null)
+          done
+          echo "::error::未找到 app 模块。当前目录树（前 60 行）："
+          find . -maxdepth 5 -not -path './.git/*' | head -n 60
+          exit 1
+
+      - name: Prepare signing (optional)
+        id: signing
+        shell: bash
+        env:
+          KS_B64: ${{ secrets.SIGNING_KEYSTORE_BASE64 }}
+          STORE_PASS: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.SIGNING_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$KS_B64" || -z "$STORE_PASS" || -z "$ALIAS" || -z "$KEY_PASS" ]]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::未配置签名 Secrets，本次只产出 Debug APK（可直接安装）"
+            exit 0
+          fi
+          KS="$RUNNER_TEMP/release.jks"
+          printf '%s' "$KS_B64" | base64 --decode > "$KS"
+          if [ ! -s "$KS" ]; then
+            echo "::error::签名文件为空或 base64 无法解码"
+            exit 1
+          fi
+          chmod 600 "$KS"
+          echo "::add-mask::$STORE_PASS"
+          echo "::add-mask::$KEY_PASS"
+          {
+            echo "SIGNING_STORE_FILE=$KS"
+            echo "SIGNING_STORE_PASSWORD=$STORE_PASS"
+            echo "SIGNING_KEY_ALIAS=$ALIAS"
+            echo "SIGNING_KEY_PASSWORD=$KEY_PASS"
+          } >> "$GITHUB_ENV"
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+          echo "Release 签名已就绪"
+
+      - name: Assemble
+        shell: bash
+        env:
+          PROJECT_DIR: ${{ steps.project.outputs.dir }}
+          SIGNED: ${{ steps.signing.outputs.enabled }}
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          # 源码内没有 gradle wrapper，用 setup-gradle 装好的系统 gradle
+          if [ -x ./gradlew ]; then chmod +x ./gradlew; CMD="./gradlew"; else CMD="gradle"; fi
+          echo "使用构建命令：$CMD"
+          LOG="$RUNNER_TEMP/assemble.log"
+          echo "ASSEMBLE_LOG=$LOG" >> "$GITHUB_ENV"
+          set +e
+          "$CMD" --no-daemon --stacktrace :app:assembleDebug 2>&1 | tee "$LOG"
+          DEBUG_RC=${PIPESTATUS[0]}
+          set -e
+          if [ "$DEBUG_RC" -ne 0 ]; then exit "$DEBUG_RC"; fi
+          if [ "$SIGNED" = "true" ]; then
+            "$CMD" --no-daemon --stacktrace :app:assembleRelease 2>&1 | tee -a "$LOG"
+          fi
+
+      # 编译失败时把 Kotlin 的 e: 报错行直接打到日志顶部，不用翻长日志
+      - name: Report compile errors
+        if: failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          LOG="${ASSEMBLE_LOG:-$RUNNER_TEMP/assemble.log}"
+          echo '===== Kotlin 编译错误（e: 行）====='
+          if [ -f "$LOG" ]; then
+            grep -E '^e: ' "$LOG" | head -n 40 || true
+            echo '----- 上下文（每个错误前后 2 行）-----'
+            grep -n -B2 -A2 -E '^e: ' "$LOG" | head -n 120 || true
+          else
+            echo "未找到编译日志：$LOG"
+          fi
+          exit 1
+
+      - name: Verify APK
+        id: verify
+        shell: bash
+        env:
+          PROJECT_DIR: ${{ steps.project.outputs.dir }}
+          SIGNED: ${{ steps.signing.outputs.enabled }}
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          APK="$(find app/build/outputs/apk/debug -maxdepth 1 -name '*.apk' -type f | head -n 1)"
+          test -n "$APK" || { echo "::error::未生成 Debug APK"; exit 1; }
+          unzip -t "$APK" > /dev/null
+          # 必须是有效 APK：含 AndroidManifest.xml 与 classes*.dex，否则手机会报「解析软件包时出现问题」
+          unzip -l "$APK" | grep -q "AndroidManifest.xml" || { echo "::error::APK 缺少 AndroidManifest.xml"; exit 1; }
+          unzip -l "$APK" | grep -q "classes.*\.dex" || { echo "::error::APK 缺少 classes.dex"; exit 1; }
+          BYTES="$(stat -c%s "$APK")"
+          if (( BYTES < 1048576 )); then
+            echo "::error::APK 过小（$BYTES 字节），构建可能不完整"
+            exit 1
+          fi
+          if [ "$SIGNED" = 'true' ]; then
+            REL="$(find app/build/outputs/apk/release -maxdepth 1 -name '*.apk' -type f | head -n 1)"
+            test -n "$REL" || { echo "::error::未生成 Release APK"; exit 1; }
+            "$ANDROID_HOME/build-tools/${BUILD_TOOLS}/apksigner" verify --verbose "$REL"
+          fi
+          {
+            echo '## 构建结果'
+            echo ''
+            echo '| 产物 | 大小 | SHA-256（前 16 位） |'
+            echo '| --- | --- | --- |'
+            for f in $(find app/build/outputs/apk -name '*.apk' -type f | sort); do
+              printf '| `%s` | %s | `%s` |\n' "$f" "$(du -h "$f" | cut -f1)" "$(sha256sum "$f" | cut -c1-16)"
+            done
+            echo ''
+            echo "签名状态：$( [ "$SIGNED" = 'true' ] && echo '已签名 Release' || echo '仅 Debug' )"
+            echo ''
+            echo '> Artifacts 下载到的是 zip，需先解压出里面的 .apk 再安装；直接把 zip 改名成 .apk 会报「解析软件包时出现问题」。'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug-${{ github.run_number }}
+          path: ${{ steps.project.outputs.dir }}/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+      - name: Upload signed Release APK
+        if: steps.signing.outputs.enabled == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release-${{ github.run_number }}
+          path: ${{ steps.project.outputs.dir }}/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 90
+
+  release:
+    name: Attach APK to Release
+    if: startsWith(github.ref, 'refs/tags/v') && needs.build.outputs.signed == 'true'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download APK
+        uses: actions/download-artifact@v4
+        with:
+          name: app-release-${{ github.run_number }}
+          path: apk
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: gh release create "$TAG" --generate-notes --title "$TAG" apk/*.apk
