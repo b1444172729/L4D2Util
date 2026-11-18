@@ -1,0 +1,373 @@
+name: 编译 QS Rikkahud（分卷合并 → 解压 → 构建）
+
+on:
+  # 分卷全部提交后一次性 push 触发；paths 里用通配符覆盖任意卷数
+  push:
+    paths:
+      - 'qs_rikkahud.zip'
+      - 'qs_rikkahud.zip.*'
+  # 分卷上传完，到 Actions 页面手动 Run workflow 最稳妥
+  workflow_dispatch:
+    inputs:
+      zip_name:
+        description: '源码包基础名（相对仓库根，分卷会自动识别同名 .partN / .001）'
+        required: true
+        default: 'qs_rikkahud.zip'
+        type: string
+      build_type:
+        description: '构建类型；release 用仓库内置 keystore 签正式包'
+        required: true
+        default: 'release'
+        type: choice
+        options:
+          - release
+          - debug
+          - both
+      expected_sha256:
+        description: '合并后 zip 的 SHA-256；填 auto 则只做 zip 完整性校验'
+        required: false
+        default: '92bb89f4c098a7a27b64ba76dd47e3d4b4bda20511d6f0ed8903ff8e85a73bd0'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      BUILD_TYPE: ${{ inputs.build_type || 'release' }}
+
+    steps:
+      - name: 检出仓库（含分卷文件）
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          lfs: true
+
+      - name: 合并分卷 / 准备源码包
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - "$GITHUB_WORKSPACE" "${{ runner.temp }}" \
+                  "${{ inputs.zip_name || 'qs_rikkahud.zip' }}" \
+                  "${{ inputs.expected_sha256 || 'auto' }}" <<'PY'
+          import os, sys, glob, re, shutil, hashlib, zipfile
+
+          ws, temp, name, expect = sys.argv[1:5]
+          single = os.path.join(ws, name)
+          out = os.path.join(temp, 'source.zip')
+
+          def collect(pattern, rx):
+              hits = []
+              for p in glob.glob(os.path.join(ws, pattern)):
+                  m = re.search(rx, os.path.basename(p))
+                  if m and os.path.isfile(p):
+                      hits.append((int(m.group(1)), p))
+              hits.sort(key=lambda x: x[0])
+              return hits
+
+          if os.path.isfile(single):
+              shutil.copyfile(single, out)
+              print('模式：单文件 %s' % name)
+          else:
+              # 优先 .partN（part1/2/3 或 split -d 的 part0/1/2 都认）
+              # 其次 .001/.002（7-Zip、WinRAR 风格）
+              parts = collect(name + '.part*', r'\.part(\d+)$')
+              if not parts:
+                  parts = collect(name + '.*', r'\.(\d{2,3})$')
+              if not parts:
+                  print('::error::仓库里既没有 %s，也没有它的分卷（%s.part* / %s.001）' % (name, name, name))
+                  print('::error::分卷要一次性全部提交；只传了一部分就触发构建会走到这里')
+                  sys.exit(1)
+              nums = [n for n, _ in parts]
+              if nums != list(range(nums[0], nums[0] + len(nums))):
+                  print('::error::分卷序号不连续：%s，疑似漏传或混入旧卷' % nums)
+                  sys.exit(1)
+              with open(out, 'wb') as w:
+                  for n, p in parts:
+                      sz = os.path.getsize(p)
+                      print('  合并 %-32s %10d bytes' % (os.path.basename(p), sz))
+                      with open(p, 'rb') as r:
+                          shutil.copyfileobj(r, w, 1024 * 1024)
+              print('模式：%d 个分卷（序号 %d..%d）' % (len(parts), nums[0], nums[-1]))
+
+          size = os.path.getsize(out)
+          print('合并结果：%s（%d 字节）' % (out, size))
+
+          # zip 完整性：testzip 会逐条 CRC 校验，顺序错/缺卷/截断都能抓出来
+          with zipfile.ZipFile(out) as z:
+              bad = z.testzip()
+              entries = len(z.infolist())
+          if bad:
+              print('::error::zip 内文件损坏：%s' % bad)
+              sys.exit(1)
+          print('zip 完整性 OK，%d 个条目' % entries)
+
+          h = hashlib.sha256()
+          with open(out, 'rb') as f:
+              for block in iter(lambda: f.read(1024 * 1024), b''):
+                  h.update(block)
+          digest = h.hexdigest()
+          print('合并后 SHA-256：%s' % digest)
+          want = (expect or '').strip().lower()
+          if want and want not in ('auto', 'none', 'skip'):
+              if digest != want:
+                  print('::error::SHA-256 不符，预期 %s，实际 %s' % (want, digest))
+                  print('::error::多半是分卷顺序错、混入了旧卷，或你重新压了源码包（那就填新包的 sha256，或改成 auto）')
+                  sys.exit(1)
+              print('SHA-256 校验通过')
+          PY
+
+      - name: 解压 zip 并定位工程根
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - "${{ runner.temp }}/source.zip" "${{ runner.temp }}" <<'PY'
+          import os, sys, zipfile, shutil
+
+          zpath, temp = sys.argv[1], sys.argv[2]
+          unpack = os.path.join(temp, 'unpack')
+          project = os.path.join(temp, 'project')
+          for p in (unpack, project):
+              shutil.rmtree(p, ignore_errors=True)
+          os.makedirs(unpack)
+
+          skip_prefix = ('.git/', '__MACOSX/')
+          with zipfile.ZipFile(zpath) as z:
+              infos = z.infolist()
+              for info in infos:
+                  name = info.filename
+                  # Windows 压缩的中文名常是 GBK 且没打 UTF-8 标记，尽力还原
+                  if not (info.flag_bits & 0x800):
+                      try:
+                          name = name.encode('cp437').decode('gbk')
+                      except (UnicodeEncodeError, UnicodeDecodeError):
+                          pass
+                  if name.startswith(skip_prefix) or name.endswith(('.DS_Store', 'Thumbs.db')):
+                      continue
+                  target = os.path.normpath(os.path.join(unpack, name))
+                  if not (target == unpack or target.startswith(unpack + os.sep)):
+                      continue  # 防 Zip Slip
+                  if info.is_dir() or name.endswith('/'):
+                      os.makedirs(target, exist_ok=True)
+                      continue
+                  os.makedirs(os.path.dirname(target), exist_ok=True)
+                  with z.open(info) as src, open(target, 'wb') as dst:
+                      shutil.copyfileobj(src, dst)
+          print('解压条目数：%d' % len(infos))
+
+          # zip 里套几层文件夹都行：认「settings.gradle.kts 与 gradlew 同目录」
+          hits = []
+          for d, dirs, files in os.walk(unpack):
+              if 'settings.gradle.kts' in files and 'gradlew' in files:
+                  hits.append(d)
+          if not hits:
+              print('::error::解压后找不到工程根（需同时含 settings.gradle.kts 与 gradlew）')
+              for d, dirs, files in os.walk(unpack):
+                  if d.count(os.sep) - unpack.count(os.sep) <= 2:
+                      print('  目录 %s -> %s' % (os.path.relpath(d, unpack), files[:8]))
+              sys.exit(1)
+          root = min(hits, key=lambda p: (p.count(os.sep), len(p)))
+          print('识别到的工程根：%s' % os.path.relpath(root, unpack))
+          shutil.move(root, project)
+
+          # zip 不保留 Unix 可执行位；Windows 压缩包还会给 gradlew 带 CRLF
+          gw = os.path.join(project, 'gradlew')
+          os.chmod(gw, 0o755)
+          with open(gw, 'rb') as f:
+              data = f.read()
+          with open(gw, 'wb') as f:
+              f.write(data.replace(b'\r\n', b'\n'))
+          print('工程已就位：%s' % project)
+          PY
+
+      - name: 预检工程完整性
+        working-directory: ${{ runner.temp }}/project
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "=== 关键文件 ==="
+          miss=0
+          for f in settings.gradle.kts build.gradle.kts gradlew gradle/wrapper/gradle-wrapper.jar \
+                   gradle/libs.versions.toml app/build.gradle.kts app/src/main/AndroidManifest.xml \
+                   app/google-services.json web-ui/package.json web-ui/pnpm-lock.yaml \
+                   keystore/wesdtf698.jks keystore/keystore.properties; do
+            if [ -f "$f" ]; then echo "  OK   $f"; else echo "  MISS $f"; miss=$((miss+1)); fi
+          done
+          echo "=== 重复源码副本检查 ==="
+          bad=$(find . -path './.git' -prune -o -type f \( -name '*(1).kt' -o -name '*(2).kt' \
+                -o -name '*__*.kt' -o -name '*副本*' \) -print 2>/dev/null | head -30 || true)
+          if [ -n "$bad" ]; then
+            echo "::error::发现重复副本，会造成 Conflicting overloads，删掉后重新压缩上传："
+            printf '%s\n' "$bad"
+            exit 1
+          fi
+          echo "  未发现重复副本"
+          echo "=== Kotlin / Java 源文件数 ==="
+          find . -type f \( -name '*.kt' -o -name '*.java' \) | wc -l
+          [ "$miss" -eq 0 ] || echo "::warning::有 $miss 个关键文件缺失，请结合构建日志判断"
+
+      - name: JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Gradle 9.6.0（缓存 wrapper 与依赖）
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.6.0'
+
+      - name: 准备 Android SDK（不用 setup-android，避开已下线的 tools 包）
+        shell: bash
+        run: |
+          set -euo pipefail
+          MIRROR_SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+
+          # 探测 sdkmanager：优先镜像自带的 cmdline-tools/latest
+          SM=""
+          for c in "$MIRROR_SDK/cmdline-tools/latest/bin/sdkmanager" \
+                   "$MIRROR_SDK/cmdline-tools/20.0/bin/sdkmanager" \
+                   "$MIRROR_SDK/cmdline-tools/16.0/bin/sdkmanager"; do
+            if [ -x "$c" ]; then SM="$c"; break; fi
+          done
+          if [ -z "$SM" ]; then
+            SM=$(find "$MIRROR_SDK/cmdline-tools" -name sdkmanager -type f 2>/dev/null | sort -V | tail -1 || true)
+          fi
+          if [ -z "$SM" ]; then SM=$(command -v sdkmanager || true); fi
+          [ -n "$SM" ] || { echo "::error::找不到 sdkmanager，无法确定 Android SDK"; exit 1; }
+          echo "sdkmanager: $SM"
+
+          # SDK 根目录：优先镜像自带；不可写时换到 runner temp，保证 AGP 能自动补包
+          SDK_ROOT="$MIRROR_SDK"
+          if [ ! -w "$SDK_ROOT" ]; then
+            SDK_ROOT="${RUNNER_TEMP}/android-sdk"
+            mkdir -p "$SDK_ROOT"
+            echo "::warning::镜像 SDK 不可写，改用可写目录 $SDK_ROOT"
+          fi
+          echo "ANDROID_HOME=$SDK_ROOT"      >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "$(dirname "$SM")"          >> "$GITHUB_PATH"
+
+          SDKM() { "$SM" --sdk_root="$SDK_ROOT" "$@"; }
+
+          # 1) 接受 licenses（AGP 自动下载 SDK 组件的前提）
+          yes | SDKM --licenses >/dev/null 2>&1 || true
+
+          # 2) 只装确定存在的包。旧 SDK Tools 包 'tools' 已被 Google 下线，
+          #    setup-android@v3 默认 packages 仍是 'tools platform-tools'，
+          #    在 2026 新镜像上执行 sdkmanager tools 必然 exit 1 —— 所以这里不用那个 action
+          SDKM --install "platform-tools" >/dev/null 2>&1 \
+            || echo "::warning::platform-tools 安装跳过（镜像可能已自带）"
+
+          # 3) 项目 compileSdk / targetSdk = 37
+          SDKM --install "platforms;android-37" >/dev/null 2>&1 \
+            || echo "::warning::platforms;android-37 未装成，交给 AGP 自动下载"
+
+          # 4) build-tools 装仓库里最新的一个；AGP 9.4 需要别的版本时会自行下载
+          BT=$(SDKM --list 2>/dev/null | grep -oE 'build-tools;[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -1 || true)
+          if [ -n "$BT" ]; then
+            echo "安装 build-tools: $BT"
+            SDKM --install "$BT" >/dev/null 2>&1 || echo "::warning::$BT 安装跳过"
+          fi
+
+          echo "=== 已安装 SDK 包 ==="
+          SDKM --list_installed 2>/dev/null | grep -E 'platforms;|build-tools;|platform-tools' || true
+          echo "ANDROID_HOME=$SDK_ROOT"
+
+      - name: pnpm 11
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - name: Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: 安装 web-ui 依赖
+        working-directory: ${{ runner.temp }}/project/web-ui
+        shell: bash
+        run: |
+          pnpm install --frozen-lockfile \
+            || { echo "::warning::lockfile 与 package.json 不完全一致，改用非冻结安装"; pnpm install --no-frozen-lockfile; }
+
+      - name: 编译 Release APK
+        if: ${{ env.BUILD_TYPE != 'debug' }}
+        working-directory: ${{ runner.temp }}/project
+        shell: bash
+        run: |
+          set -o pipefail
+          # --no-configuration-cache 必须加：签名在配置阶段求值，缓存会固化错误结果
+          ./gradlew :app:assembleRelease --no-configuration-cache --stacktrace 2>&1 \
+            | tee "$GITHUB_WORKSPACE/build-release.log"
+
+      - name: 编译 Debug APK
+        if: ${{ env.BUILD_TYPE == 'debug' || env.BUILD_TYPE == 'both' }}
+        working-directory: ${{ runner.temp }}/project
+        shell: bash
+        run: |
+          set -o pipefail
+          ./gradlew :app:assembleDebug --no-configuration-cache --stacktrace 2>&1 \
+            | tee "$GITHUB_WORKSPACE/build-debug.log"
+
+      - name: 检查产物签名（只报告，不阻断）
+        if: ${{ env.BUILD_TYPE != 'debug' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          P="${{ runner.temp }}/project"
+          APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name apksigner -type f 2>/dev/null | sort -V | tail -1 || true)
+          shopt -s nullglob
+          for APK in "$P"/app/build/outputs/apk/release/*.apk; do
+            echo "---------- $(basename "$APK") ----------"
+            if [ -n "$APKSIGNER" ]; then
+              "$APKSIGNER" verify --print-certs "$APK" \
+                | grep -Ei 'Verified using|Signer #1 certificate (DN|SHA-256)' || true
+              if "$APKSIGNER" verify --print-certs "$APK" | grep -qi 'CN=Android Debug'; then
+                echo "::warning::这个 release 包是 debug 签名，签名配置没生效"
+              fi
+            fi
+          done
+
+      - name: 汇总 APK 产物
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          P="${{ runner.temp }}/project"
+          OUT="$GITHUB_WORKSPACE/out"
+          rm -rf "$OUT"; mkdir -p "$OUT"
+          n=0
+          for d in release debug; do
+            [ -d "$P/app/build/outputs/apk/$d" ] || continue
+            for f in "$P"/app/build/outputs/apk/$d/*.apk; do
+              [ -e "$f" ] || continue
+              cp "$f" "$OUT/${d}-$(basename "$f")"
+              n=$((n+1))
+            done
+          done
+          echo "共收集 $n 个 APK"
+          ls -lh "$OUT" || true
+
+      - name: 上传 APK
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qs-rikkahud-apk-${{ env.BUILD_TYPE }}
+          path: out/*.apk
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: 上传构建日志（失败时）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qs-rikkahud-build-logs
+          path: |
+            build-release.log
+            build-debug.log
+          if-no-files-found: ignore
+          retention-days: 7
