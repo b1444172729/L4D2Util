@@ -1,0 +1,273 @@
+# 放到仓库的 .github/workflows/build.yml
+# 触发：把 DSH.zip 提交到仓库根目录即自动构建；也可在 Actions 页手动运行
+#
+# 压缩包里套了一层（甚至多层）文件夹也没关系：脚本解压后按 build.sh 的
+# 位置反推工程根目录，不依赖外层文件夹叫什么名字。
+
+name: 编译 DSH 补丁 APK
+
+on:
+  push:
+    paths:
+      - 'DSH.zip'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+    inputs:
+      zip_path:
+        description: '仓库内压缩包的路径'
+        required: false
+        default: 'DSH.zip'
+      android_all_ver:
+        description: '兜底用的 Robolectric android-all 版本'
+        required: false
+        default: '14-robolectric-10818077-i6'
+
+permissions:
+  contents: write
+
+env:
+  ZIP_PATH: 'DSH.zip'
+  APKTOOL_VER: '2.9.3'
+  BUILD_TOOLS_VER: '34.0.0'
+  # 包内有中文目录名（参考 / 破 / 破限）和带空格目录（Android Studio），统一 UTF-8
+  LANG: C.UTF-8
+  LC_ALL: C.UTF-8
+  JAVA_TOOL_OPTIONS: '-Dfile.encoding=UTF-8'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 准备 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # ------------------------------------------------------------------
+      # 1) 解压 + 自动剥掉外层文件夹
+      # ------------------------------------------------------------------
+      - name: 解压 DSH.zip 并定位工程根
+        id: unpack
+        env:
+          ZIP_IN: ${{ inputs.zip_path }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP="${ZIP_IN:-$ZIP_PATH}"
+          [ -f "$ZIP" ] || { echo "::error::找不到 $ZIP，请把压缩包提交到仓库并确认路径"; exit 1; }
+          echo "解压: $ZIP"
+          rm -rf _unpack && mkdir -p _unpack
+
+          # 用 python zipfile 而不是 unzip：兼容中文/空格文件名，并防 zip-slip 路径穿越
+          python3 - "$ZIP" _unpack <<'PY'
+          import os, sys, zipfile
+          src, dest = sys.argv[1], os.path.abspath(sys.argv[2])
+          with zipfile.ZipFile(src) as z:
+              infos = z.infolist()
+              for info in infos:
+                  name = info.filename
+                  # 旧压缩工具未置 UTF-8 flag 时，zipfile 会按 cp437 误读
+                  if not (info.flag_bits & 0x800):
+                      try:
+                          name = name.encode('cp437').decode('utf-8')
+                      except (UnicodeEncodeError, UnicodeDecodeError):
+                          pass
+                  target = os.path.normpath(os.path.join(dest, name))
+                  if target != dest and not target.startswith(dest + os.sep):
+                      raise SystemExit('::error::压缩包含非法路径: ' + name)
+                  if info.is_dir() or name.endswith('/'):
+                      os.makedirs(target, exist_ok=True)
+                      continue
+                  os.makedirs(os.path.dirname(target), exist_ok=True)
+                  with z.open(info) as f, open(target, 'wb') as out:
+                      out.write(f.read())
+          print('解压完成，共 %d 项' % len(infos))
+          PY
+
+          # 关键：不猜外层文件夹名字，直接找 build.sh 所在目录作为工程根
+          SH=$(find _unpack -type f -name build.sh -print -quit)
+          if [ -n "$SH" ]; then
+            ROOT=$(cd "$(dirname "$SH")" && pwd)
+          else
+            J=$(find _unpack -type f -path '*/com/ds/dspatch/Exp.java' -print -quit)
+            [ -n "$J" ] || { echo "::error::解压后没找到 build.sh，也没找到 src/com/ds/dspatch/Exp.java，目录结构不符"; exit 1; }
+            ROOT=$(cd "$(dirname "$J")/../../../.." && pwd)
+          fi
+          [ -d "$ROOT/src/com/ds/dspatch" ] || { echo "::error::$ROOT 下没有 src/com/ds/dspatch"; exit 1; }
+
+          echo "工程根: $ROOT"
+          echo "--- 顶层内容 ---"
+          find "$ROOT" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort
+          echo "root=$ROOT" >> "$GITHUB_OUTPUT"
+
+      # ------------------------------------------------------------------
+      # 2) 判定档位：有 dsdec/ 才能出完整 APK，否则只编 classes4.dex
+      # ------------------------------------------------------------------
+      - name: 判定构建档位
+        id: mode
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT='${{ steps.unpack.outputs.root }}'
+          if [ -d "$ROOT/dsdec" ] && { [ -f "$ROOT/dsdec/apktool.yml" ] || [ -f "$ROOT/dsdec/AndroidManifest.xml" ]; }; then
+            echo "full=true" >> "$GITHUB_OUTPUT"
+            echo "检测到 dsdec/（apktool 反编译工程）→ 走完整六步，出签名 APK"
+          else
+            echo "full=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::包内没有 dsdec/，本次只编译 classes4.dex。要出完整 APK，请把原 APK 的 apktool 反编译工程一起打进 zip 的 dsdec/ 目录"
+          fi
+          if [ -d "$ROOT/patched_smali" ]; then
+            echo "::notice::检测到 patched_smali/，请确认这些 smali 已合入 dsdec/ 对应的 smali_classesN/ 目录；脚本不猜测 dex 分包位置"
+          fi
+
+      # ------------------------------------------------------------------
+      # 3) 补齐工具链：包内自带 > runner 预装 > 自动下载/现场生成
+      # ------------------------------------------------------------------
+      - name: 准备构建工具链
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          KS_PASS_IN: ${{ secrets.KEYSTORE_PASSWORD }}
+          ANDROID_ALL_VER: ${{ inputs.android_all_ver }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT='${{ steps.unpack.outputs.root }}'
+          FULL='${{ steps.mode.outputs.full }}'
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "Android SDK: $SDK"
+          mkdir -p "$ROOT/bt"
+
+          # 3.1 d8 / zipalign / apksigner：优先用包内自带 bt/，缺的从 SDK build-tools 软链
+          NEED=0
+          for t in d8 zipalign apksigner; do [ -x "$ROOT/bt/$t" ] || NEED=1; done
+          if [ "$NEED" = 1 ]; then
+            BT_SDK=$(find "$SDK/build-tools" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort -V | tail -1 || true)
+            if [ -z "$BT_SDK" ]; then
+              SDKM=$(find "$SDK" -type f -name sdkmanager -print -quit)
+              [ -n "$SDKM" ] || { echo "::error::找不到 sdkmanager，无法安装 build-tools"; exit 1; }
+              yes | "$SDKM" --licenses >/dev/null 2>&1 || true
+              "$SDKM" "build-tools;$BUILD_TOOLS_VER"
+              BT_SDK="$SDK/build-tools/$BUILD_TOOLS_VER"
+            fi
+            echo "使用 build-tools: $BT_SDK"
+            for t in d8 zipalign apksigner; do
+              if [ ! -x "$ROOT/bt/$t" ]; then
+                [ -x "$BT_SDK/$t" ] || { echo "::error::缺 $BT_SDK/$t"; exit 1; }
+                ln -sf "$BT_SDK/$t" "$ROOT/bt/$t"
+              fi
+            done
+          else
+            echo "使用包内自带 bt/ 工具链"
+          fi
+
+          # 3.2 apktool.jar（只有出完整 APK 才需要）
+          if [ "$FULL" = "true" ] && [ ! -f "$ROOT/apktool.jar" ]; then
+            echo "下载 apktool $APKTOOL_VER"
+            curl -fsSL --retry 3 -o "$ROOT/apktool.jar" \
+              "https://github.com/iBotPeaches/Apktool/releases/download/v$APKTOOL_VER/apktool_$APKTOOL_VER.jar" \
+              || { echo "::error::apktool 下载失败，请检查 env.APKTOOL_VER 的版本号是否存在"; exit 1; }
+          fi
+
+          # 3.3 android-all.jar：编译期提供 android.* / org.json.*
+          #     包内自带 > SDK platform 的 android.jar > Maven 上的 Robolectric android-all
+          if [ ! -f "$ROOT/android-all.jar" ]; then
+            PJ=$(find "$SDK/platforms" -maxdepth 2 -name android.jar -print -quit 2>/dev/null || true)
+            if [ -n "$PJ" ]; then
+              cp "$PJ" "$ROOT/android-all.jar"
+              echo "用 SDK platform 的 android.jar 作为编译期依赖"
+            else
+              VER="${ANDROID_ALL_VER:-14-robolectric-10818077-i6}"
+              echo "下载 android-all $VER"
+              curl -fsSL --retry 3 -o "$ROOT/android-all.jar" \
+                "https://repo1.maven.org/maven2/org/robolectric/android-all/$VER/android-all-$VER.jar" \
+                || { echo "::error::android-all 下载失败，可在 workflow_dispatch 里改 android_all_ver"; exit 1; }
+            fi
+          fi
+
+          # 3.4 签名：优先 Secrets（签名稳定，可覆盖安装），否则包内自带，最后现场自签
+          KS_PASS="${KS_PASS_IN:-android}"
+          if [ -n "$KEYSTORE_B64" ]; then
+            printf '%s' "$KEYSTORE_B64" | base64 -d > "$ROOT/ds.keystore"
+            echo "使用 Secrets 中的 keystore（alias 必须为 ds，口令与 KEYSTORE_PASSWORD 一致）"
+          elif [ -f "$ROOT/ds.keystore" ]; then
+            echo "使用包内自带 ds.keystore"
+          else
+            keytool -genkeypair -noprompt -keystore "$ROOT/ds.keystore" \
+              -alias ds -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass "$KS_PASS" -keypass "$KS_PASS" \
+              -dname "CN=ldp, OU=ldp, O=ldp, L=ldp, ST=ldp, C=CN"
+            echo "::notice::未配置 KEYSTORE_BASE64，已现场生成自签证书；每次构建签名不同，覆盖安装需先卸载旧包"
+          fi
+          echo "KS_PASS=$KS_PASS" >> "$GITHUB_ENV"
+
+      # ------------------------------------------------------------------
+      # 4) 编译：直接复用包里的 build.sh，不改动它
+      # ------------------------------------------------------------------
+      - name: 执行编译
+        id: compile
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT='${{ steps.unpack.outputs.root }}'
+          FULL='${{ steps.mode.outputs.full }}'
+          export BASE="$ROOT"
+          export BT="$ROOT/bt"
+          export APKTOOL="$ROOT/apktool.jar"
+          export ANDROID_JAR="$ROOT/android-all.jar"
+          export DSDEC="$ROOT/dsdec"
+          export KEYSTORE="$ROOT/ds.keystore"
+          export KS_PASS="${KS_PASS:-android}"
+
+          if [ "$FULL" = "true" ]; then
+            # javac -> d8(classes4.dex) -> apktool b -> 注入 dex -> zipalign -> apksigner
+            bash "$ROOT/build.sh" "$ROOT/DeepSeekMod.apk"
+            echo "产物: $ROOT/DeepSeekMod.apk"
+            echo "apk=$ROOT/DeepSeekMod.apk" >> "$GITHUB_OUTPUT"
+          else
+            # 只跑 build.sh 的前两步，产出可注入原 APK 的 classes4.dex
+            CLS="$ROOT/build/cls"
+            DEXDIR="$ROOT/build/dex"
+            rm -rf "$CLS" "$DEXDIR"
+            mkdir -p "$CLS" "$DEXDIR"
+            javac -nowarn -source 8 -target 8 -encoding UTF-8 \
+              -d "$CLS" -cp "$ANDROID_JAR" "$ROOT"/src/com/ds/dspatch/*.java
+            "$BT/d8" --min-api 23 --lib "$ANDROID_JAR" --output "$DEXDIR" \
+              $(find "$CLS" -name '*.class')
+            mv "$DEXDIR/classes.dex" "$DEXDIR/classes4.dex"
+            echo "产物: $DEXDIR/classes4.dex"
+          fi
+
+          {
+            echo "### DSH 构建结果"
+            echo "- 工程根：\`$ROOT\`"
+            echo "- 档位：$([ "$FULL" = "true" ] && echo '完整签名 APK' || echo '仅 classes4.dex（缺 dsdec/）')"
+            [ "$FULL" = "true" ] && echo "- APK：\`$ROOT/DeepSeekMod.apk\`" || true
+            echo "- dex：\`$ROOT/build/dex/classes4.dex\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ------------------------------------------------------------------
+      # 5) 产物
+      # ------------------------------------------------------------------
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: DSH-${{ github.run_number }}
+          path: |
+            ${{ steps.unpack.outputs.root }}/DeepSeekMod.apk
+            ${{ steps.unpack.outputs.root }}/build/dex/classes4.dex
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: 打 Tag 时发布 Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ steps.unpack.outputs.root }}/DeepSeekMod.apk
+            ${{ steps.unpack.outputs.root }}/build/dex/classes4.dex
+          fail_on_unmatched_files: false
